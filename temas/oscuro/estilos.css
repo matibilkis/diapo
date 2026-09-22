@@ -1,0 +1,32 @@
+/* ===== ESTILOS · los marcados «estilo:» aparecen en el selector de la barra; los «fondo:», en el botón Fondo ===== */
+.slide{font-weight:300}
+.slide a{color:var(--link)}
+/* estilo: Título */ .titulo{font:700 64px/1.18 var(--f-titulo);color:var(--amarillo)}
+/* estilo: Título fino */ .titulo-fino{font:300 58px/1.2 var(--f-titulo);color:var(--amarillo)}
+/* estilo: Título blanco */ .titulo-blanco{font:700 64px/1.18 var(--f-titulo);color:var(--texto)}
+/* estilo: Título plan */ .titulo-plan{font:300 72px/1.1 var(--f-titulo);color:#e8e8e8}
+/* estilo: Plan */ .plan{font:300 44px/1.6 var(--f-titulo);color:var(--amarillo);text-align:center}
+/* estilo: A mano */ .mano{font:700 84px/1.02 var(--f-mano);color:var(--amarillo)}
+/* estilo: A mano blanca */ .mano-blanca{font:400 60px/1.05 var(--f-mano);color:var(--texto)}
+/* estilo: A mano verde */ .mano-verde{font:700 46px/1.05 var(--f-mano);color:var(--verde-mano);text-align:center}
+/* estilo: Cuerpo */ .cuerpo{font:300 32px/1.3 var(--f-cuerpo);color:var(--texto)}
+/* estilo: Chico */ .chico{font:300 20px/1.35 var(--f-cuerpo);color:var(--gris)}
+/* estilo: Verde */ .verde{font:700 32px/1.25 var(--f-cuerpo);color:var(--verde)}
+/* estilo: Verde fino */ .verde-fino{font:300 32px/1.25 var(--f-cuerpo);color:var(--verde)}
+/* estilo: Cita */ .cita{font:italic 300 32px/1.3 var(--f-cuerpo);color:var(--texto)}
+/* estilo: Dato grande */ .dato{font:800 64px/1 var(--f-titulo);color:var(--amarillo)}
+/* estilo: [Fuente] */ .fuente,.fuentes a{font:700 26px/1.2 var(--f-link);color:var(--link);text-decoration:underline}
+/* estilo: Fila de fuentes */ .fuentes{font:700 26px/1.5 var(--f-link);color:var(--link)}
+.fuentes a{margin-right:.55em}
+/* estilo: Pastilla */ .pill{font:700 24px/1.5 var(--f-link);color:#fff;background:var(--rojo);border-radius:26px;text-align:center}
+/* estilo: Portada, título */ .portada-titulo{font:700 44px/1.15 var(--f-titulo);color:#000}
+/* estilo: Portada, subtítulo */ .portada-sub{font:italic 400 38px/1.2 var(--f-titulo);color:#000}
+/* estilo: Portada, link */ .portada-link{font:700 24px/1.3 var(--f-link);color:var(--violeta)!important;text-decoration:none}
+/* estilo: Etiqueta */ .etiqueta{font:700 18px/1 var(--f-link);color:var(--numero);border:2px solid var(--numero);border-radius:6px;padding:6px 10px;letter-spacing:.1em}
+/* fondo: Blanco */ .slide.blanca{background:#fff;color:#000}
+.amarillo{color:var(--amarillo)}
+.verde-txt{color:var(--verde)}
+.naranja-txt{color:var(--numero)}
+.borde-rojo{border:5px solid var(--rojo)}
+.flecha{background:linear-gradient(90deg,#0c4a1c,#25a336 55%,#0c4a1c);clip-path:polygon(0 30%,95% 30%,95% 0,100% 50%,95% 100%,95% 70%,0 70%)}
+.tabla th{font-weight:700;color:var(--amarillo)}

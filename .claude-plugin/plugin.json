@@ -1,0 +1,9 @@
+{
+  "name": "diapo",
+  "description": "Presentaciones HTML de un solo archivo: se editan en el navegador como en Google Slides y Claude las edita como texto. Incluye un panel de chat dentro de la presentación.",
+  "version": "1.0.0",
+  "author": { "name": "Matías Bilkis", "url": "https://github.com/matibilkis" },
+  "homepage": "https://github.com/matibilkis/diapo",
+  "license": "MIT",
+  "keywords": ["slides", "presentaciones", "html", "pptx", "pdf"]
+}

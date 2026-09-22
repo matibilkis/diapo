@@ -1,0 +1,17 @@
+/* ===== TEMA · colores y tipografías de toda la presentación (también con el botón «Tema») ===== */
+:root{
+  --fondo: #ffffff;       /* fondo de las slides */
+  --texto: #1b1b1f;       /* texto normal */
+  --azul: #2b6cb0;        /* títulos */
+  --marino: #1a365e;      /* título de portada */
+  --rojo: #c53030;        /* para marcar algo */
+  --verde: #2f855a;       /* otra marca */
+  --gris: #6b7280;        /* texto chico */
+  --numero: #8a8f98;      /* número de slide */
+  --link: #2b6cb0;        /* [fuentes] */
+  --divisora: #2b6cb0;    /* fondo de las divisoras */
+  --numero-tam: 18px;
+  --f-titulo: 'STIX Two Text', 'Times New Roman', serif;
+  --f-cuerpo: 'STIX Two Text', 'Times New Roman', serif;
+  --f-link: Arial, Helvetica, sans-serif;
+}

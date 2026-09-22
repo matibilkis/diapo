@@ -1,0 +1,2281 @@
+#!/usr/bin/env python3
+"""diapo · presentaciones HTML que se editan en el navegador y se arman junto con Claude.
+
+Comandos:
+  nuevo       crea una presentación a partir de un tema
+  importar    convierte un .pptx (PowerPoint o Google Slides) o un .pdf
+  ver         la abre con un servidor local: guarda directo y se recarga sola si Claude cambia el archivo
+  revisar     la renderiza sin ventana, busca problemas y saca capturas para mirar
+  pdf         exporta a PDF, una slide por página
+  pedidos     lista los pedidos a Claude que quedaron en la presentación
+  actualizar  pone el motor de diapo al día en una presentación vieja
+  previa      arma una copia solo para mirar, lista para publicar como artifact
+  temas       muestra los temas disponibles
+
+Cada comando tiene su ayuda: diapo COMANDO --help
+"""
+from __future__ import annotations
+
+import argparse
+import colorsys
+import hashlib
+import html as htmllib
+import io
+import json
+import math
+import os
+import posixpath
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import webbrowser
+import zipfile
+from collections import Counter
+from datetime import datetime
+from html.parser import HTMLParser
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree as ET
+
+RAIZ = Path(__file__).resolve().parent
+MOTOR_JS = RAIZ / 'motor' / 'motor.js'
+MOTOR_CSS = RAIZ / 'motor' / 'motor.css'
+TEMAS = RAIZ / 'temas'
+VERSION = '1'
+UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+
+
+def esc(s: str) -> str:
+    return htmllib.escape(str(s), quote=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f'diapo: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def escribir(path: Path, texto: str) -> None:
+    tmp = path.with_name(f'.{path.name}.tmp')
+    tmp.write_text(texto, encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def carpeta_oculta(carpeta: Path, sub: str = '') -> Path:
+    base = carpeta / '.diapo'
+    base.mkdir(exist_ok=True)
+    gi = base / '.gitignore'
+    if not gi.exists():
+        gi.write_text('*\n', encoding='utf-8')
+    if sub:
+        (base / sub).mkdir(parents=True, exist_ok=True)
+        return base / sub
+    return base
+
+
+def respaldar(archivo: Path, guardar: int = 30) -> None:
+    if not archivo.exists():
+        return
+    dest = carpeta_oculta(archivo.parent, 'respaldos')
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    shutil.copy2(archivo, dest / f'{archivo.stem}.{stamp}{archivo.suffix}')
+    viejos = sorted(dest.glob(f'{archivo.stem}.*{archivo.suffix}'))
+    for v in viejos[:-guardar]:
+        v.unlink(missing_ok=True)
+
+
+def resolver_deck(ruta: str) -> Path:
+    p = Path(ruta).expanduser()
+    if p.is_dir():
+        htmls = sorted(x for x in p.glob('*.html') if not x.name.startswith('.'))
+        if len(htmls) != 1:
+            die(f'en {p} hay {len(htmls)} archivos .html; indicá cuál.')
+        p = htmls[0]
+    if not p.exists():
+        die(f'no existe {p}')
+    return p.resolve()
+
+
+def es_diapo(texto: str) -> bool:
+    return 'id="motor-css"' in texto and 'id="motor"' in texto
+
+
+# ----------------------------------------------------------------------------
+# armado del archivo
+# ----------------------------------------------------------------------------
+
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'diapo' / 'config.json'
+
+
+def config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+
+
+def tema_dir(nombre: str) -> Path:
+    d = TEMAS / nombre
+    if not (d / 'tema.json').exists():
+        disponibles = ', '.join(sorted(x.name for x in TEMAS.iterdir() if (x / 'tema.json').exists()))
+        die(f'no conozco el tema «{nombre}». Temas: {disponibles}')
+    return d
+
+
+def armar(titulo: str, secciones: str, *, archivo: str, ancho: int = 1280, alto: int = 720,
+          fuentes_css: str, tema_css: str, estilos_css: str, google: str | None) -> str:
+    link = ''
+    if google:
+        link = ('<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+                '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+                f'<link rel="stylesheet" href="{esc(google)}">')
+    partes = [
+        '<!DOCTYPE html>',
+        '<!--',
+        f'  {titulo} · hecha con diapo ({RAIZ})',
+        f'  Para abrirla y editarla: diapo ver {archivo}   (E edita · Ctrl+S guarda · ? ayuda)',
+        f'  Formato: cada slide es un section.slide dentro de #deck; lo movible lleva la clase el y left/top/width en px sobre {ancho}×{alto};',
+        '  notas en aside.notas; pedidos a Claude en data-pedido; colores en #tema; estilos de texto en #estilos.',
+        '-->',
+        '<html lang="es">',
+        '<head>',
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f'<meta name="generator" content="diapo {VERSION}">',
+        f'<title>{esc(titulo)}</title>',
+        f'<style id="fuentes">\n{fuentes_css.strip()}\n</style>',
+        link,
+        f'<style id="tema">\n{tema_css.strip()}\n</style>',
+        f'<style id="estilos">\n{estilos_css.strip()}\n</style>',
+        f'<style id="motor-css">\n{MOTOR_CSS.read_text(encoding="utf-8").strip()}\n</style>',
+        '</head>',
+        '<body>',
+        f'<div id="deck" data-ancho="{ancho}" data-alto="{alto}">',
+        secciones.strip(),
+        '</div>',
+        '',
+        f'<script id="motor">\n{MOTOR_JS.read_text(encoding="utf-8").strip()}\n</script>',
+        '</body>',
+        '</html>',
+        '',
+    ]
+    return '\n'.join(partes)
+
+
+def copiar_fuentes(tdir: Path, carpeta: Path) -> None:
+    src = tdir / 'fonts'
+    if not src.is_dir():
+        return
+    dst = carpeta / 'fonts'
+    dst.mkdir(exist_ok=True)
+    for f in src.glob('*.woff2'):
+        if not (dst / f.name).exists():
+            shutil.copy2(f, dst / f.name)
+    lic = src / 'licencias'
+    if lic.is_dir():
+        (dst / 'licencias').mkdir(exist_ok=True)
+        for f in lic.glob('*.txt'):
+            if not (dst / 'licencias' / f.name).exists():
+                shutil.copy2(f, dst / 'licencias' / f.name)
+
+
+def cmd_nuevo(a) -> None:
+    destino = Path(a.carpeta).expanduser()
+    archivo = destino if destino.suffix.lower() in ('.html', '.htm') else destino / f'{destino.name}.html'
+    archivo = archivo.resolve()
+    if archivo.exists():
+        die(f'ya existe {archivo}; abrila con: diapo ver {archivo}')
+    tdir = tema_dir(a.tema)
+    meta = json.loads((tdir / 'tema.json').read_text(encoding='utf-8'))
+    carpeta = archivo.parent
+    carpeta.mkdir(parents=True, exist_ok=True)
+    (carpeta / 'img').mkdir(exist_ok=True)
+    copiar_fuentes(tdir, carpeta)
+    titulo = a.titulo or archivo.stem.replace('-', ' ').replace('_', ' ').strip().capitalize()
+    c = config()
+    secciones = (tdir / 'inicio.html').read_text(encoding='utf-8')
+    for clave, valor in (('titulo', titulo), ('nombre', c.get('nombre') or 'Tu nombre'), ('mail', c.get('mail') or 'tu@correo')):
+        secciones = secciones.replace('{{' + clave + '}}', esc(valor))
+    escribir(archivo, armar(titulo, secciones, archivo=archivo.name,
+                            fuentes_css=(tdir / 'fuentes.css').read_text(encoding='utf-8'),
+                            tema_css=(tdir / 'tema.css').read_text(encoding='utf-8'),
+                            estilos_css=(tdir / 'estilos.css').read_text(encoding='utf-8'),
+                            google=meta.get('google')))
+    carpeta_oculta(carpeta)
+    print(f'Lista: {archivo}')
+    print(f'Tema «{a.tema}», slides de ejemplo para reemplazar.')
+    print(f'Abrila con: diapo ver {archivo}')
+
+
+def cmd_config(a) -> None:
+    c = config()
+    for k in ('nombre', 'mail'):
+        v = getattr(a, k, None)
+        if v is not None:
+            c[k] = v
+    if any(getattr(a, k, None) is not None for k in ('nombre', 'mail')):
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG.write_text(json.dumps(c, ensure_ascii=False, indent=1), encoding='utf-8')
+    print(f'{CONFIG}:')
+    print(f'  nombre: {c.get("nombre") or "(sin poner)"}')
+    print(f'  mail:   {c.get("mail") or "(sin poner)"}')
+    print('Se usan en la portada de las presentaciones nuevas.')
+
+
+def cmd_temas(a) -> None:
+    for d in sorted(TEMAS.iterdir()):
+        f = d / 'tema.json'
+        if f.exists():
+            meta = json.loads(f.read_text(encoding='utf-8'))
+            print(f'{d.name:10s} {meta.get("descripcion", "")}')
+
+
+# ----------------------------------------------------------------------------
+# fuentes de Google (para trabajar sin internet)
+# ----------------------------------------------------------------------------
+
+SISTEMA = {
+    'arial', 'helvetica', 'helvetica neue', 'calibri', 'calibri light', 'cambria', 'times new roman', 'times', 'georgia',
+    'verdana', 'tahoma', 'trebuchet ms', 'courier new', 'courier', 'segoe ui', 'comic sans ms', 'impact', 'century gothic',
+    'gill sans', 'gill sans mt', 'consolas', 'wingdings', 'wingdings 2', 'wingdings 3', 'symbol', 'webdings', 'garamond',
+    'book antiqua', 'palatino linotype', 'franklin gothic medium', 'lucida sans', 'lucida grande', 'menlo', 'monaco',
+    'aptos', 'aptos display', 'noto color emoji', 'apple color emoji', 'segoe ui emoji', 'segoe ui symbol', 'arial black',
+    'arial narrow', 'candara', 'constantia', 'corbel', 'baskerville old face', 'rockwell',
+}
+
+
+def bajar_fuentes(familias: dict, fonts_dir: Path) -> tuple[str, list[str]]:
+    reglas, faltan = [], []
+    for fam in sorted(familias):
+        if fam.lower() in SISTEMA:
+            continue
+        info = familias[fam]
+        pesos = sorted(info['pesos'] or {400})
+        pedidos = []
+        if info['italica']:
+            pedidos.append(f'{fam}:ital,wght@' + ';'.join([f'0,{w}' for w in pesos] + [f'1,{w}' for w in pesos]))
+        pedidos.append(f'{fam}:wght@' + ';'.join(str(w) for w in pesos))
+        pedidos.append(fam)
+        css = None
+        for q in pedidos:
+            url = 'https://fonts.googleapis.com/css2?family=' + quote(q, safe=':,;@') + '&display=swap'
+            try:
+                css = urlopen(Request(url, headers={'User-Agent': UA}), timeout=15).read().decode('utf-8')
+                break
+            except Exception:
+                css = None
+        if not css:
+            faltan.append(fam)
+            continue
+        fonts_dir.mkdir(exist_ok=True)
+        for subset, body in re.findall(r'/\*\s*([\w-]+)\s*\*/\s*@font-face\s*{([^}]*)}', css):
+            if subset != 'latin':
+                continue
+            style = re.search(r'font-style:\s*(\w+)', body).group(1)
+            weight = re.search(r'font-weight:\s*([\d ]+);', body).group(1).strip()
+            src = re.search(r'url\((https[^)]+)\)', body).group(1)
+            nombre = f"{re.sub(r'[^A-Za-z0-9]', '', fam)}-{style}-{weight.replace(' ', '-')}.woff2"
+            if not (fonts_dir / nombre).exists():
+                try:
+                    (fonts_dir / nombre).write_bytes(urlopen(Request(src, headers={'User-Agent': UA}), timeout=30).read())
+                except Exception:
+                    continue
+            reglas.append(f"@font-face{{font-family:'{fam}';font-style:{style};font-weight:{weight};font-display:swap;src:url(fonts/{nombre}) format('woff2')}}")
+    return '\n'.join(reglas), faltan
+
+
+# ----------------------------------------------------------------------------
+# importar PowerPoint / Google Slides (.pptx)
+# ----------------------------------------------------------------------------
+
+A = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+P = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
+R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+MC = '{http://schemas.openxmlformats.org/markup-compatibility/2006}'
+
+PESOS = {'thin': 100, 'hairline': 100, 'extralight': 200, 'ultralight': 200, 'light': 300, 'regular': 400, 'normal': 400,
+         'book': 400, 'medium': 500, 'semibold': 600, 'demibold': 600, 'bold': 700, 'extrabold': 800, 'ultrabold': 800,
+         'black': 900, 'heavy': 900}
+SERIF = ('serif', 'times', 'georgia', 'garamond', 'stix', 'merriweather', 'playfair', 'lora', 'baskerville', 'cambria',
+         'caslon', 'crimson', 'spectral', 'vollkorn', 'bitter', 'domine', 'alegreya', 'cormorant', 'slab', 'zilla', 'arvo',
+         'antiqua', 'palatino', 'quattrocento', 'libre bodoni', 'old standard', 'noticia', 'tinos')
+MONO = ('mono', 'code', 'courier', 'consolas', 'menlo', 'cousine')
+MANO = ('amatic', 'caveat', 'indie flower', 'shadows into light', 'permanent marker', 'patrick hand', 'gloria', 'kalam',
+        'comic', 'handlee', 'architects daughter', 'reenie')
+PRST_COLOR = {'black': '000000', 'white': 'FFFFFF', 'red': 'FF0000', 'green': '008000', 'blue': '0000FF', 'yellow': 'FFFF00',
+              'gray': '808080', 'grey': '808080', 'orange': 'FFA500', 'purple': '800080', 'darkBlue': '00008B'}
+CIRCULOS = ('ellipse', 'flowChartConnector', 'donut')
+WINGDINGS = {'§': '▪', 'Ø': '➢', 'ü': '✓', 'q': '❑', 'v': '❖', 'l': '●', 'n': '■', 'Ÿ': '•', 'Ü': '➔', 'à': '➔', 'o': '○'}
+CLIP = {
+    'rightArrow': 'polygon(0 25%,60% 25%,60% 0,100% 50%,60% 100%,60% 75%,0 75%)',
+    'leftArrow': 'polygon(100% 25%,40% 25%,40% 0,0 50%,40% 100%,40% 75%,100% 75%)',
+    'upArrow': 'polygon(25% 100%,25% 40%,0 40%,50% 0,100% 40%,75% 40%,75% 100%)',
+    'downArrow': 'polygon(25% 0,25% 60%,0 60%,50% 100%,100% 60%,75% 60%,75% 0)',
+    'triangle': 'polygon(50% 0,100% 100%,0 100%)',
+    'rtTriangle': 'polygon(0 0,100% 100%,0 100%)',
+    'diamond': 'polygon(50% 0,100% 50%,50% 100%,0 50%)',
+    'chevron': 'polygon(0 0,75% 0,100% 50%,75% 100%,0 100%,25% 50%)',
+    'homePlate': 'polygon(0 0,80% 0,100% 50%,80% 100%,0 100%)',
+    'parallelogram': 'polygon(25% 0,100% 0,75% 100%,0 100%)',
+    'hexagon': 'polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%)',
+    'octagon': 'polygon(30% 0,70% 0,100% 30%,100% 70%,70% 100%,30% 100%,0 70%,0 30%)',
+    'star5': 'polygon(50% 0,61% 35%,98% 35%,68% 57%,79% 91%,50% 70%,21% 91%,32% 57%,2% 35%,39% 35%)',
+    'pentagon': 'polygon(0 0,80% 0,100% 50%,80% 100%,0 100%)',
+}
+
+
+def local(tag: str) -> str:
+    return tag.rsplit('}', 1)[-1]
+
+
+def es_verdad(v) -> bool:
+    return v in ('1', 'true', 'on')
+
+
+def separar_peso(face: str) -> tuple[str, int | None]:
+    partes = face.split()
+    if len(partes) > 2 and (partes[-2] + partes[-1]).lower() in PESOS:
+        return ' '.join(partes[:-2]), PESOS[(partes[-2] + partes[-1]).lower()]
+    if len(partes) > 1 and partes[-1].lower().replace('-', '') in PESOS:
+        return ' '.join(partes[:-1]), PESOS[partes[-1].lower().replace('-', '')]
+    return face, None
+
+
+def familia_css(nombre: str) -> str:
+    n = nombre.lower()
+    gen = ('monospace' if any(k in n for k in MONO) else 'cursive' if any(k in n for k in MANO)
+           else 'serif' if any(k in n for k in SERIF) else 'sans-serif')
+    return f"'{nombre}', {gen}"
+
+
+def css_str(d: dict) -> str:
+    return ';'.join(f'{k}:{v}' for k, v in d.items())
+
+
+def px(v: float) -> str:
+    v = round(v, 1)
+    return f'{int(v)}px' if v == int(v) else f'{v}px'
+
+
+class Contexto:
+    """Colores, tipografías y estilos de texto de un patrón (master)."""
+
+    def __init__(self, imp: 'Pptx', master_part: str):
+        self.part = master_part
+        self.tree = imp.xml(master_part)
+        theme = next((imp.target(master_part, t) for t, typ, _ in imp.rels(master_part).values() if typ.endswith('/theme')), None)
+        self.colores: dict[str, str] = {}
+        self.mayor = self.menor = 'Arial'
+        if theme and theme in imp.names:
+            th = imp.xml(theme)
+            cs = th.find(f'.//{A}clrScheme')
+            for c in (cs if cs is not None else []):
+                if not len(c):
+                    continue
+                ch = c[0]
+                if local(ch.tag) == 'srgbClr':
+                    self.colores[local(c.tag)] = ch.get('val')
+                elif local(ch.tag) == 'sysClr':
+                    self.colores[local(c.tag)] = ch.get('lastClr') or ('000000' if ch.get('val') == 'windowText' else 'FFFFFF')
+            fs = th.find(f'.//{A}fontScheme')
+            if fs is not None:
+                mj, mn = fs.find(f'{A}majorFont/{A}latin'), fs.find(f'{A}minorFont/{A}latin')
+                self.mayor = (mj.get('typeface') if mj is not None else None) or 'Arial'
+                self.menor = (mn.get('typeface') if mn is not None else None) or 'Arial'
+        cm = self.tree.find(f'{P}clrMap')
+        self.clrmap = dict(cm.attrib) if cm is not None else {'bg1': 'lt1', 'tx1': 'dk1', 'bg2': 'lt2', 'tx2': 'dk2'}
+        self.txstyles = self.tree.find(f'{P}txStyles')
+
+
+class Pptx:
+    def __init__(self, path: Path, carpeta: Path, ancho: int = 1280):
+        self.z = zipfile.ZipFile(path)
+        self.names = set(self.z.namelist())
+        self.rels_cache: dict = {}
+        pres = self.xml('ppt/presentation.xml')
+        sz = pres.find(f'{P}sldSz')
+        self.cx, self.cy = int(sz.get('cx')), int(sz.get('cy'))
+        self.W = ancho
+        self.k = ancho / self.cx
+        self.H = round(self.cy * self.k)
+        self.ptpx = 12700 * self.k
+        rels = self.rels('ppt/presentation.xml')
+        lst = pres.find(f'{P}sldIdLst')
+        self.slides = [self.target('ppt/presentation.xml', rels[s.get(R + 'id')][0]) for s in (lst if lst is not None else [])]
+        self.default_text = pres.find(f'{P}defaultTextStyle')
+        self.carpeta = carpeta
+        self.img_dir = carpeta / 'img'
+        self.cache: dict = {}
+        self.usados: set = set()
+        self.ctxs: dict[str, Contexto] = {}
+        self.stats = Counter()
+        self.familias: dict = {}
+        self.numero = None
+
+    # --- partes del zip
+    def xml(self, part: str):
+        return ET.fromstring(self.z.read(part))
+
+    def rels(self, part: str) -> dict:
+        if part in self.rels_cache:
+            return self.rels_cache[part]
+        rp = posixpath.join(posixpath.dirname(part), '_rels', posixpath.basename(part) + '.rels')
+        out = {}
+        if rp in self.names:
+            for r in ET.fromstring(self.z.read(rp)):
+                out[r.get('Id')] = (r.get('Target'), r.get('Type', ''), r.get('TargetMode', ''))
+        self.rels_cache[part] = out
+        return out
+
+    def target(self, part: str, t: str) -> str:
+        return posixpath.normpath(posixpath.join(posixpath.dirname(part), t))
+
+    def rel_de_tipo(self, part: str, sufijo: str) -> str | None:
+        return next((self.target(part, t) for t, typ, mode in self.rels(part).values() if typ.endswith(sufijo) and mode != 'External'), None)
+
+    # --- colores
+    def color(self, ctx: Contexto, parent) -> str | None:
+        if parent is None:
+            return None
+        for ch in parent:
+            t = local(ch.tag)
+            if t == 'srgbClr':
+                base = ch.get('val')
+            elif t == 'schemeClr':
+                v = ch.get('val')
+                if v == 'phClr':
+                    return None
+                base = ctx.colores.get(ctx.clrmap.get(v, v))
+            elif t == 'sysClr':
+                base = ch.get('lastClr') or ('000000' if ch.get('val') == 'windowText' else 'FFFFFF')
+            elif t == 'prstClr':
+                base = PRST_COLOR.get(ch.get('val'), '000000')
+            elif t == 'scrgbClr':
+                base = '%02x%02x%02x' % tuple(round(min(int(ch.get(k, '0')) / 100000, 1) * 255) for k in ('r', 'g', 'b'))
+            else:
+                continue
+            if not base:
+                return None
+            return self.mods(base, ch)
+        return None
+
+    def esquema(self, ctx: Contexto, nombre: str) -> str | None:
+        base = ctx.colores.get(ctx.clrmap.get(nombre, nombre))
+        return f'#{base.lower()}' if base else None
+
+    @staticmethod
+    def mods(base: str, el) -> str:
+        r, g, b = (int(base[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        alpha = 1.0
+        for m in el:
+            t, v = local(m.tag), int(m.get('val', '0')) / 100000
+            if t in ('lumMod', 'lumOff', 'satMod'):
+                h, l, s = colorsys.rgb_to_hls(r, g, b)
+                if t == 'lumMod':
+                    l *= v
+                elif t == 'lumOff':
+                    l += v
+                else:
+                    s *= v
+                r, g, b = colorsys.hls_to_rgb(h, min(max(l, 0), 1), min(max(s, 0), 1))
+            elif t == 'tint':
+                r, g, b = (1 - (1 - c) * v for c in (r, g, b))
+            elif t == 'shade':
+                r, g, b = (c * v for c in (r, g, b))
+            elif t == 'alpha':
+                alpha = v
+        rgb = tuple(round(min(max(c, 0), 1) * 255) for c in (r, g, b))
+        if alpha < 0.999:
+            return f'rgba({rgb[0]},{rgb[1]},{rgb[2]},{alpha:.2f})'
+        return '#%02x%02x%02x' % rgb
+
+    def gradiente(self, ctx, gf) -> str | None:
+        stops = []
+        for gs in gf.findall(f'{A}gsLst/{A}gs'):
+            c = self.color(ctx, gs)
+            if c:
+                stops.append(f'{c} {int(gs.get("pos", "0")) / 1000:.0f}%')
+        lin = gf.find(f'{A}lin')
+        ang = int(lin.get('ang', '0')) / 60000 if lin is not None else 0
+        return f'linear-gradient({ang + 90:.0f}deg,{",".join(stops)})' if stops else None
+
+    def relleno(self, ctx, spPr, style) -> str | None:
+        if spPr is not None:
+            if spPr.find(f'{A}noFill') is not None:
+                return None
+            sf = spPr.find(f'{A}solidFill')
+            if sf is not None:
+                return self.color(ctx, sf)
+            gf = spPr.find(f'{A}gradFill')
+            if gf is not None:
+                return self.gradiente(ctx, gf)
+            pf = spPr.find(f'{A}pattFill')
+            if pf is not None:
+                return self.color(ctx, pf.find(f'{A}fgClr'))
+            if spPr.find(f'{A}blipFill') is not None:
+                return None
+        if style is not None:
+            fr = style.find(f'{A}fillRef')
+            if fr is not None and fr.get('idx') not in (None, '0'):
+                return self.color(ctx, fr)
+        return None
+
+    def linea(self, ctx, spPr, style):
+        ln = spPr.find(f'{A}ln') if spPr is not None else None
+        ancho = None
+        if ln is not None:
+            if ln.find(f'{A}noFill') is not None:
+                return None
+            ancho = max(int(ln.get('w', '12700')) * self.k, 1)
+            c = self.color(ctx, ln.find(f'{A}solidFill'))
+            if c:
+                dash = ln.find(f'{A}prstDash')
+                return ancho, c, 'dashed' if dash is not None and dash.get('val') not in (None, 'solid') else 'solid'
+        if style is not None:
+            lr = style.find(f'{A}lnRef')
+            if lr is not None and lr.get('idx') not in (None, '0'):
+                c = self.color(ctx, lr)
+                if c:
+                    return ancho or max(9525 * self.k, 1), c, 'solid'
+        return None
+
+    # --- estilos de texto en cascada
+    @staticmethod
+    def nivel(lst, lvl: int):
+        return lst.find(f'{A}lvl{lvl + 1}pPr') if lst is not None else None
+
+    @staticmethod
+    def props_r(rPr) -> dict:
+        d = {}
+        if rPr is None:
+            return d
+        for k in ('sz', 'b', 'i', 'u', 'strike', 'baseline', 'cap'):
+            if rPr.get(k) is not None:
+                d[k] = rPr.get(k)
+        lat = rPr.find(f'{A}latin')
+        if lat is not None and lat.get('typeface'):
+            d['latin'] = lat.get('typeface')
+        sf = rPr.find(f'{A}solidFill')
+        if sf is not None:
+            d['fill'] = sf
+        if rPr.find(f'{A}noFill') is not None:
+            d['nofill'] = True
+        hl = rPr.find(f'{A}hlinkClick')
+        if hl is not None and hl.get(R + 'id'):
+            d['link'] = hl.get(R + 'id')
+        return d
+
+    def props_p(self, pPr) -> dict:
+        d = {}
+        if pPr is None:
+            return d
+        for k in ('algn', 'marL', 'indent'):
+            if pPr.get(k) is not None:
+                d[k] = pPr.get(k)
+        for t in ('lnSpc', 'spcBef', 'spcAft'):
+            e = pPr.find(A + t)
+            if e is not None:
+                pct, pts = e.find(f'{A}spcPct'), e.find(f'{A}spcPts')
+                if pct is not None:
+                    d[t] = ('pct', int(pct.get('val')))
+                elif pts is not None:
+                    d[t] = ('pts', int(pts.get('val')))
+        if pPr.find(f'{A}buNone') is not None:
+            d['bu'] = None
+        elif pPr.find(f'{A}buChar') is not None:
+            d['bu'] = ('char', pPr.find(f'{A}buChar').get('char', '•'))
+        elif pPr.find(f'{A}buAutoNum') is not None:
+            an = pPr.find(f'{A}buAutoNum')
+            d['bu'] = ('num', an.get('type', 'arabicPeriod'), int(an.get('startAt', '1')))
+        bf = pPr.find(f'{A}buFont')
+        if bf is not None:
+            d['buFont'] = bf.get('typeface', '')
+        bc = pPr.find(f'{A}buClr')
+        if bc is not None:
+            d['buClr'] = bc
+        d['defRPr'] = self.props_r(pPr.find(f'{A}defRPr'))
+        return d
+
+    @staticmethod
+    def ph(sp):
+        ph = sp.find(f'.//{P}nvPr/{P}ph')
+        if ph is None:
+            return None
+        return ph.get('type', 'body'), ph.get('idx')
+
+    @staticmethod
+    def buscar_ph(tree, tipo: str, idx: str | None):
+        if tree is None:
+            return None
+        norm = {'ctrTitle': 'title', 'subTitle': 'body', 'obj': 'body'}
+        cands = []
+        for sp in tree.iter():
+            if local(sp.tag) not in ('sp', 'pic'):
+                continue
+            ph = sp.find(f'.//{P}nvPr/{P}ph')
+            if ph is not None:
+                cands.append((sp, ph.get('type', 'body'), ph.get('idx')))
+        if idx is not None:
+            for sp, t, i in cands:
+                if i == idx:
+                    return sp
+        for sp, t, i in cands:
+            if t == tipo:
+                return sp
+        for sp, t, i in cands:
+            if norm.get(t, t) == norm.get(tipo, tipo):
+                return sp
+        return None
+
+    def cascada(self, ctx: Contexto, sp, lay, lvl: int):
+        capas = []
+        info = self.ph(sp)
+        if info:
+            tipo, idx = info
+            nombre = 'titleStyle' if tipo in ('title', 'ctrTitle') else 'bodyStyle' if tipo in ('body', 'subTitle', 'obj') else 'otherStyle'
+            if ctx.txstyles is not None:
+                capas.append(self.nivel(ctx.txstyles.find(P + nombre), lvl))
+            msp = self.buscar_ph(ctx.tree, tipo, None)
+            if msp is not None:
+                capas.append(self.nivel(msp.find(f'{P}txBody/{A}lstStyle'), lvl))
+            lsp = self.buscar_ph(lay, tipo, idx)
+            if lsp is not None:
+                capas.append(self.nivel(lsp.find(f'{P}txBody/{A}lstStyle'), lvl))
+        else:
+            capas.append(self.nivel(self.default_text, lvl))
+            if ctx.txstyles is not None:
+                capas.append(self.nivel(ctx.txstyles.find(f'{P}otherStyle'), lvl))
+        capas.append(self.nivel(sp.find(f'{P}txBody/{A}lstStyle'), lvl))
+        pd, rd = {}, {}
+        for c in capas:
+            d = self.props_p(c)
+            rd.update(d.pop('defRPr', {}))
+            pd.update(d)
+        return pd, rd
+
+    def cuerpo_props(self, ctx, sp, lay) -> dict:
+        d = {}
+        chain = []
+        info = self.ph(sp)
+        if info:
+            msp = self.buscar_ph(ctx.tree, info[0], None)
+            lsp = self.buscar_ph(lay, info[0], info[1])
+            chain += [x for x in (msp, lsp) if x is not None]
+        chain.append(sp)
+        for s in chain:
+            bp = s.find(f'{P}txBody/{A}bodyPr')
+            if bp is None:
+                continue
+            for k in ('anchor', 'lIns', 'tIns', 'rIns', 'bIns', 'wrap'):
+                if bp.get(k) is not None:
+                    d[k] = bp.get(k)
+            na = bp.find(f'{A}normAutofit')
+            if na is not None:
+                d['fontScale'] = int(na.get('fontScale', '100000'))
+                d['lnRed'] = int(na.get('lnSpcReduction', '0'))
+        return d
+
+    def registrar(self, fam: str, peso: int, italica: bool) -> None:
+        info = self.familias.setdefault(fam, {'pesos': set(), 'italica': False})
+        info['pesos'].add(peso)
+        info['italica'] = info['italica'] or italica
+
+    def run_css(self, ctx: Contexto, rp: dict, escala: float) -> dict:
+        css = {}
+        sz = int(rp['sz']) / 100 if rp.get('sz') else 18
+        tam = sz * self.ptpx * escala
+        face = rp.get('latin') or '+mn-lt'
+        if face.startswith('+mj'):
+            face = ctx.mayor
+        elif face.startswith('+'):
+            face = ctx.menor
+        fam, peso = separar_peso(face)
+        w = peso or 400
+        if es_verdad(rp.get('b')):
+            w = max(w, 700)
+        italica = es_verdad(rp.get('i'))
+        self.registrar(fam, w, italica)
+        css['font-family'] = familia_css(fam)
+        css['font-weight'] = str(w)
+        if italica:
+            css['font-style'] = 'italic'
+        deco = []
+        if rp.get('u') not in (None, 'none'):
+            deco.append('underline')
+        if rp.get('strike') not in (None, 'noStrike'):
+            deco.append('line-through')
+        if deco:
+            css['text-decoration'] = ' '.join(deco)
+        if rp.get('nofill'):
+            css['color'] = 'transparent'
+        else:
+            c = self.color(ctx, rp.get('fill')) if rp.get('fill') is not None else None
+            css['color'] = c or self.esquema(ctx, 'tx1') or '#000000'
+        bl = rp.get('baseline')
+        if bl and bl != '0':
+            css['vertical-align'] = 'super' if int(bl) > 0 else 'sub'
+            tam *= 0.7
+        css['font-size'] = px(tam)
+        if rp.get('cap') == 'all':
+            css['text-transform'] = 'uppercase'
+        elif rp.get('cap') == 'small':
+            css['font-variant'] = 'small-caps'
+        return css
+
+    def texto(self, ctx, sp, lay, txBody, rels_part: str, num: int):
+        """Devuelve (html interno, css común del texto, css del cuerpo) o None si no hay texto."""
+        bp = self.cuerpo_props(ctx, sp, lay) if sp is not None else {}
+        escala = bp.get('fontScale', 100000) / 100000
+        red = bp.get('lnRed', 0) / 100000
+        parrafos = []
+        hay_texto = False
+        for p in txBody.findall(f'{A}p'):
+            pPr = p.find(f'{A}pPr')
+            lvl = int(pPr.get('lvl', '0')) if pPr is not None else 0
+            pd, rd = self.cascada(ctx, sp, lay, lvl) if sp is not None else ({}, {})
+            own = self.props_p(pPr)
+            rd = {**rd, **own.pop('defRPr', {})}
+            pd = {**pd, **own}
+            items = []
+            for node in p:
+                t = local(node.tag)
+                if t in ('r', 'fld'):
+                    rp = {**rd, **self.props_r(node.find(f'{A}rPr'))}
+                    txt = node.findtext(f'{A}t') or ''
+                    if t == 'fld' and node.get('type') == 'slidenum':
+                        txt = str(num)
+                    if txt.strip():
+                        hay_texto = True
+                    items.append(('r', self.run_css(ctx, rp, escala), txt, rp.get('link')))
+                elif t == 'br':
+                    items.append(('br',))
+            end = p.find(f'{A}endParaRPr')
+            end_css = self.run_css(ctx, {**rd, **self.props_r(end)}, escala)
+            parrafos.append((pd, items, end_css))
+        if not hay_texto:
+            return None
+        cuenta = Counter()
+        for pd, items, end_css in parrafos:
+            for it in items:
+                if it[0] == 'r' and it[2].strip():
+                    cuenta[tuple(sorted(it[1].items()))] += len(it[2])
+        dom = dict(cuenta.most_common(1)[0][0]) if cuenta else {}
+        rels = self.rels(rels_part)
+        html_ps = []
+        contadores: dict[int, int] = {}
+        alineacion = next((pd.get('algn', 'l') for pd, items, _ in parrafos if any(it[0] == 'r' and it[2].strip() for it in items)), 'l')
+        for pd, items, end_css in parrafos:
+            pcss = {}
+            algn = pd.get('algn')
+            if algn in ('ctr', 'r', 'just', 'dist'):
+                pcss['text-align'] = {'ctr': 'center', 'r': 'right', 'just': 'justify', 'dist': 'justify'}[algn]
+            ln = pd.get('lnSpc')
+            if ln:
+                pcss['line-height'] = f'{max(ln[1] / 100000 * 1.2 - red, 0.6):.2f}' if ln[0] == 'pct' else px(ln[1] / 100 * self.ptpx)
+            else:
+                pcss['line-height'] = f'{max(1.2 - red, 0.6):.2f}'
+            for k, prop in (('spcBef', 'margin-top'), ('spcAft', 'margin-bottom')):
+                v = pd.get(k)
+                if v and v[1]:
+                    pcss[prop] = px(v[1] / 100 * self.ptpx) if v[0] == 'pts' else f'{v[1] / 100000 * 1.2:.2f}em'
+            marl = int(pd.get('marL', '0')) * self.k
+            ind = int(pd.get('indent', '0')) * self.k
+            texto_p = any(it[0] == 'r' and it[2].strip() for it in items)
+            bu = pd.get('bu') if texto_p else None
+            if marl or ind:
+                pcss['padding-left'] = px(marl)
+                if ind:
+                    pcss['text-indent'] = px(ind)
+            vineta = ''
+            if bu:
+                lvl_key = int(round(marl))
+                if bu[0] == 'char':
+                    ch = bu[1]
+                    if 'wingding' in pd.get('buFont', '').lower() or 'symbol' in pd.get('buFont', '').lower():
+                        ch = WINGDINGS.get(ch, '•')
+                    contadores.pop(lvl_key, None)
+                else:
+                    n = contadores.get(lvl_key, bu[2] - 1) + 1
+                    contadores[lvl_key] = n
+                    ch = self.numerar(bu[1], n)
+                bcol = self.color(ctx, pd.get('buClr')) if pd.get('buClr') is not None else None
+                vineta = f'<span style="{css_str({"color": bcol})}">{esc(ch)}</span>&nbsp;' if bcol else f'{esc(ch)}&nbsp;'
+            else:
+                contadores.clear() if not texto_p else None
+            partes = []
+            for it in items:
+                if it[0] == 'br':
+                    partes.append('<br>')
+                    continue
+                _, rcss, txt, link = it
+                if not txt:
+                    continue
+                dif = {k: v for k, v in rcss.items() if dom.get(k) != v}
+                if not txt.strip():
+                    dif = {k: v for k, v in dif.items() if k in ('font-size',)}
+                h = esc(txt).replace('  ', '&nbsp; ')
+                if dif:
+                    h = f'<span style="{css_str(dif)}">{h}</span>'
+                if link and link in rels and rels[link][2] == 'External':
+                    acss = {k: v for k, v in rcss.items() if k in ('color', 'text-decoration')}
+                    h = f'<a href="{esc(rels[link][0])}" target="_blank" rel="noopener" style="{css_str(acss)}">{h}</a>'
+                partes.append(h)
+            if not texto_p and not partes:
+                tam = end_css.get('font-size')
+                if tam and tam != dom.get('font-size'):
+                    pcss['font-size'] = tam
+                html_ps.append(f'<p style="{css_str(pcss)}"><br></p>')
+            else:
+                html_ps.append(f'<p style="{css_str(pcss)}">{vineta}{"".join(partes)}</p>')
+        cuerpo = {}
+        ins = [int(bp.get(k, d)) * self.k for k, d in (('tIns', 45720), ('rIns', 91440), ('bIns', 45720), ('lIns', 91440))]
+        cuerpo['padding'] = ' '.join(px(v) for v in ins)
+        if bp.get('wrap') == 'none':
+            cuerpo['white-space'] = 'nowrap'
+        anchor = bp.get('anchor', 't')
+        if anchor in ('ctr', 'b'):
+            cuerpo['display'] = 'flex'
+            cuerpo['flex-direction'] = 'column'
+            cuerpo['justify-content'] = 'center' if anchor == 'ctr' else 'flex-end'
+        return ''.join(html_ps), dom, cuerpo, alineacion
+
+    @staticmethod
+    def numerar(tipo: str, n: int) -> str:
+        def romano(x):
+            vals = [(1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'), (100, 'c'), (90, 'xc'), (50, 'l'), (40, 'xl'), (10, 'x'), (9, 'ix'), (5, 'v'), (4, 'iv'), (1, 'i')]
+            out = ''
+            for v, s in vals:
+                while x >= v:
+                    out += s
+                    x -= v
+            return out
+        base = (romano(n) if 'roman' in tipo.lower() else chr(96 + ((n - 1) % 26) + 1) if 'alpha' in tipo.lower() else str(n))
+        if 'Uc' in tipo:
+            base = base.upper()
+        if tipo.endswith('ParenBoth'):
+            return f'({base})'
+        if tipo.endswith('ParenR'):
+            return f'{base})'
+        if tipo.endswith('Plain'):
+            return base
+        return f'{base}.'
+
+    # --- geometría
+    @staticmethod
+    def xfrm(el):
+        for path in (f'{P}spPr/{A}xfrm', f'{P}grpSpPr/{A}xfrm', f'{P}xfrm'):
+            x = el.find(path)
+            if x is not None:
+                return x
+        return None
+
+    def caja(self, xf, T):
+        off, ext = xf.find(f'{A}off'), xf.find(f'{A}ext')
+        if off is None or ext is None:
+            return None
+        ax, sx, ay, sy = T
+        x, y = ax + sx * int(off.get('x', '0')), ay + sy * int(off.get('y', '0'))
+        w, h = sx * int(ext.get('cx', '0')), sy * int(ext.get('cy', '0'))
+        return {'x': x * self.k, 'y': y * self.k, 'w': w * self.k, 'h': h * self.k,
+                'rot': int(xf.get('rot', '0')) / 60000, 'fh': es_verdad(xf.get('flipH')), 'fv': es_verdad(xf.get('flipV'))}
+
+    def caja_de(self, sp, lay, ctx, T):
+        xf = self.xfrm(sp)
+        if xf is None or xf.find(f'{A}off') is None:
+            info = self.ph(sp)
+            if info:
+                for tree in (lay, ctx.tree):
+                    src = self.buscar_ph(tree, info[0], info[1] if tree is lay else None)
+                    if src is not None and self.xfrm(src) is not None:
+                        return self.caja(self.xfrm(src), (0, 1, 0, 1))
+            return None
+        return self.caja(xf, T)
+
+    def fuera(self, b) -> bool:
+        return b['x'] < -2 or b['y'] < -2 or b['x'] + b['w'] > self.W + 2 or b['y'] + b['h'] > self.H + 2
+
+    @staticmethod
+    def pos_css(b) -> dict:
+        css = {'left': px(b['x']), 'top': px(b['y']), 'width': px(max(b['w'], 1))}
+        tr = []
+        if b['rot']:
+            tr.append(f'rotate({b["rot"]:.1f}deg)')
+        if b['fh']:
+            tr.append('scaleX(-1)')
+        if b['fv']:
+            tr.append('scaleY(-1)')
+        if tr:
+            css['transform'] = ' '.join(tr)
+        return css
+
+    # --- imágenes
+    def imagen(self, part: str, rid: str | None, crop=(0, 0, 0, 0)) -> str | None:
+        if not rid:
+            return None
+        t = self.rels(part).get(rid)
+        if not t:
+            return None
+        target, typ, mode = t
+        if mode == 'External':
+            return target
+        media = self.target(part, target)
+        if media not in self.names:
+            return None
+        key = (media, tuple(crop))
+        if key in self.cache:
+            return self.cache[key]
+        data = self.z.read(media)
+        ext = Path(media).suffix.lower()
+        stem = re.sub(r'[^A-Za-z0-9_-]', '', Path(media).stem) or 'imagen'
+        recortar = any(crop)
+        if ext in ('.emf', '.wmf', '.tif', '.tiff', '.bmp') or recortar:
+            try:
+                from PIL import Image
+                im = Image.open(io.BytesIO(data))
+                im.load()
+            except Exception:
+                im = self.convertir_vectorial(data, ext)
+                if im is None:
+                    self.stats['imágenes que no pude convertir (EMF/WMF)'] += 1
+                    self.cache[key] = None
+                    return None
+            if recortar:
+                l, tt, r, b = (c / 100000 for c in crop)
+                w, h = im.size
+                box = (max(0, round(w * l)), max(0, round(h * tt)), min(w, round(w * (1 - r))), min(h, round(h * (1 - b))))
+                if box[2] > box[0] and box[3] > box[1]:
+                    im = im.crop(box)
+                self.stats['imágenes recortadas'] += 1
+            con_alfa = im.mode in ('RGBA', 'LA', 'P')
+            ext = '.png' if con_alfa or ext in ('.png', '.emf', '.wmf', '.bmp', '.tif', '.tiff') else '.jpg'
+            buf = io.BytesIO()
+            if ext == '.png':
+                im.save(buf, 'PNG', optimize=True)
+            else:
+                im.convert('RGB').save(buf, 'JPEG', quality=90)
+            data = buf.getvalue()
+            stem += '-recorte' if recortar else ''
+        nombre = f'{stem}{ext}'
+        i = 2
+        while nombre in self.usados:
+            nombre = f'{stem}-{i}{ext}'
+            i += 1
+        self.usados.add(nombre)
+        self.img_dir.mkdir(parents=True, exist_ok=True)
+        (self.img_dir / nombre).write_bytes(data)
+        self.cache[key] = f'img/{nombre}'
+        self.stats['imágenes'] += 1
+        return self.cache[key]
+
+    @staticmethod
+    def convertir_vectorial(data: bytes, ext: str):
+        conv = shutil.which('convert') or shutil.which('magick')
+        if not conv or ext not in ('.wmf', '.emf'):
+            return None
+        with tempfile.TemporaryDirectory() as td:
+            src, dst = Path(td) / f'in{ext}', Path(td) / 'out.png'
+            src.write_bytes(data)
+            try:
+                subprocess.run([conv, str(src), str(dst)], check=True, capture_output=True, timeout=30)
+                from PIL import Image
+                im = Image.open(dst)
+                im.load()
+                return im
+            except Exception:
+                return None
+
+    # --- elementos
+    def elemento(self, n, part, tree, lay, ctx, T, num, out: list) -> None:
+        t = local(n.tag)
+        nv = n.find(f'.//{P}cNvPr')
+        if nv is not None and es_verdad(nv.get('hidden')):
+            return
+        if t == 'AlternateContent':
+            alt = n.find(f'{MC}Fallback')
+            if alt is None:
+                alt = n.find(f'{MC}Choice')
+            for c in (alt if alt is not None else []):
+                self.elemento(c, part, tree, lay, ctx, T, num, out)
+            return
+        if t == 'grpSp':
+            xf = n.find(f'{P}grpSpPr/{A}xfrm')
+            T2 = T
+            if xf is not None and xf.find(f'{A}off') is not None and xf.find(f'{A}chExt') is not None:
+                off, ext, choff, chext = (xf.find(A + k) for k in ('off', 'ext', 'chOff', 'chExt'))
+                scx = int(ext.get('cx')) / max(int(chext.get('cx')), 1)
+                scy = int(ext.get('cy')) / max(int(chext.get('cy')), 1)
+                ax, sx, ay, sy = T
+                T2 = (ax + sx * (int(off.get('x')) - int(choff.get('x')) * scx), sx * scx,
+                      ay + sy * (int(off.get('y')) - int(choff.get('y')) * scy), sy * scy)
+            for c in n:
+                self.elemento(c, part, tree, lay, ctx, T2, num, out)
+            return
+        if t == 'sp':
+            self.forma(n, part, lay, ctx, T, num, out)
+        elif t == 'pic':
+            self.foto(n, part, lay, ctx, T, out)
+        elif t == 'cxnSp':
+            self.conector(n, ctx, T, out)
+        elif t == 'graphicFrame':
+            self.marco(n, part, lay, ctx, T, num, out)
+
+    def forma(self, sp, part, lay, ctx, T, num, out) -> None:
+        info = self.ph(sp)
+        tx = sp.find(f'{P}txBody')
+        if info and info[0] == 'sldNum':
+            if self.numero is None and tx is not None:
+                r = self.texto(ctx, sp, lay, tx, part, num)
+                if r:
+                    self.numero = (r[1].get('color'), r[1].get('font-size'))
+            return
+        b = self.caja_de(sp, lay, ctx, T)
+        if b is None:
+            return
+        spPr, style = sp.find(f'{P}spPr'), sp.find(f'{P}style')
+        fondo = self.relleno(ctx, spPr, style)
+        borde = self.linea(ctx, spPr, style)
+        geom = spPr.find(f'{A}prstGeom') if spPr is not None else None
+        prst = geom.get('prst') if geom is not None else ('custom' if spPr is not None and spPr.find(f'{A}custGeom') is not None else 'rect')
+        blip = spPr.find(f'{A}blipFill') if spPr is not None else None
+        texto = self.texto(ctx, sp, lay, tx, part, num) if tx is not None else None
+        if info and info[0] in ('dt', 'ftr') and not texto:
+            return
+        css = self.pos_css(b)
+        if blip is not None:
+            b2 = blip.find(f'{A}blip')
+            src = self.imagen(part, b2.get(R + 'embed') if b2 is not None else None)
+            if src:
+                cls = 'el' + (' circulo' if prst in CIRCULOS else ' cubrir')
+                css['height'] = px(b['h'])
+                out.append(f'<img class="{cls}" src="{esc(src)}" alt="" style="{css_str(css)}">')
+                self.stats['formas con imagen'] += 1
+        if not texto and not fondo and not borde:
+            return
+        clases = ['el'] + (['sangrado'] if self.fuera(b) else [])
+        if fondo:
+            css['background'] = fondo
+        if borde:
+            css['border'] = f'{px(borde[0])} {borde[2]} {borde[1]}'
+        if prst in CIRCULOS:
+            css['border-radius'] = '50%'
+        elif prst == 'roundRect':
+            adj = 16667
+            gd = geom.find(f'{A}avLst/{A}gd') if geom is not None else None
+            if gd is not None and gd.get('fmla', '').startswith('val '):
+                adj = int(gd.get('fmla').split()[1])
+            css['border-radius'] = px(adj / 100000 * min(b['w'], b['h']))
+        elif prst in CLIP and (fondo or borde):
+            css['clip-path'] = CLIP[prst]
+        elif prst not in ('rect', 'line', 'custom') and (fondo or borde):
+            self.stats[f'formas aproximadas como rectángulo ({prst})'] += 1
+        if prst == 'custom' and (fondo or borde):
+            self.stats['formas libres aproximadas como rectángulo'] += 1
+        interior = ''
+        if texto:
+            interior, dom, cuerpo, alin = texto
+            if not fondo and not borde and cuerpo.get('white-space') != 'nowrap':
+                # la Montserrat de Google Fonts sale ~1% más ancha que la de Google Slides: margen para que no corte renglones
+                extra = b['w'] * 0.03
+                b = dict(b, x=b['x'] - (extra / 2 if alin == 'ctr' else extra if alin == 'r' else 0), w=b['w'] + extra)
+                css.update(self.pos_css(b))
+            css.update(cuerpo)
+            css.update(dom)
+            clases.append('pptx')
+        if texto and (b['h'] and (fondo or borde or css.get('display') == 'flex')):
+            css['height'] = px(b['h'])
+        elif not texto:
+            css['height'] = px(b['h'])
+        out.append(f'<div class="{" ".join(clases)}" style="{css_str(css)}">{interior}</div>')
+        self.stats['textos' if texto else 'formas'] += 1
+
+    def foto(self, pic, part, lay, ctx, T, out) -> None:
+        b = self.caja_de(pic, lay, ctx, T)
+        if b is None:
+            return
+        css = self.pos_css(b)
+        css['height'] = px(b['h'])
+        video = pic.find(f'.//{A}videoFile')
+        if video is not None or pic.find(f'.//{A}audioFile') is not None:
+            href = None
+            rid = video.get(R + 'link') if video is not None else None
+            if rid and rid in self.rels(part):
+                href = self.rels(part)[rid][0]
+            aviso = 'Video' + (f'<br><a href="{esc(href)}" target="_blank" rel="noopener">abrir</a>' if href else ' (no importado)')
+            out.append(f'<div class="el hueco" style="{css_str(css)}">{aviso}</div>')
+            self.stats['videos (quedan como recuadro)'] += 1
+            return
+        blip = pic.find(f'{P}blipFill/{A}blip')
+        sr = pic.find(f'{P}blipFill/{A}srcRect')
+        crop = tuple(int(sr.get(k, '0')) for k in ('l', 't', 'r', 'b')) if sr is not None else (0, 0, 0, 0)
+        src = None
+        if blip is not None:
+            src = self.imagen(part, blip.get(R + 'embed'), crop) or (self.rels(part).get(blip.get(R + 'link'), (None,))[0] if blip.get(R + 'link') else None)
+        geom = pic.find(f'{P}spPr/{A}prstGeom')
+        cls = 'el' + (' circulo' if geom is not None and geom.get('prst') in CIRCULOS else '') + (' sangrado' if self.fuera(b) else '')
+        if not src:
+            out.append(f'<div class="el hueco" style="{css_str(css)}">Imagen no importada</div>')
+            return
+        borde = self.linea(ctx, pic.find(f'{P}spPr'), pic.find(f'{P}style'))
+        if borde:
+            css['border'] = f'{px(borde[0])} {borde[2]} {borde[1]}'
+        nv = pic.find(f'.//{P}cNvPr')
+        alt = nv.get('descr', '') if nv is not None else ''
+        out.append(f'<img class="{cls}" src="{esc(src)}" alt="{esc(alt)}" style="{css_str(css)}">')
+
+    def conector(self, cx, ctx, T, out) -> None:
+        xf = self.xfrm(cx)
+        if xf is None:
+            return
+        b = self.caja(xf, T)
+        if b is None:
+            return
+        borde = self.linea(ctx, cx.find(f'{P}spPr'), cx.find(f'{P}style'))
+        if not borde:
+            return
+        x1, y1, x2, y2 = b['x'], b['y'], b['x'] + b['w'], b['y'] + b['h']
+        if b['fh']:
+            x1, x2 = x2, x1
+        if b['fv']:
+            y1, y2 = y2, y1
+        largo = math.hypot(x2 - x1, y2 - y1)
+        ang = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        css = {'left': px(x1), 'top': px(y1), 'width': px(max(largo, 1)), 'height': '0',
+               'border-top': f'{px(borde[0])} {borde[2]} {borde[1]}', 'transform-origin': '0 0'}
+        if abs(ang) > 0.05:
+            css['transform'] = f'rotate({ang:.2f}deg)'
+        out.append(f'<div class="el" style="{css_str(css)}"></div>')
+        ln = cx.find(f'{P}spPr/{A}ln')
+        if ln is not None and any(e is not None and e.get('type') not in (None, 'none') for e in (ln.find(f'{A}headEnd'), ln.find(f'{A}tailEnd'))):
+            self.stats['flechas sin punta (línea sola)'] += 1
+        self.stats['líneas'] += 1
+
+    def marco(self, gf, part, lay, ctx, T, num, out) -> None:
+        xf = self.xfrm(gf)
+        b = self.caja(xf, T) if xf is not None else None
+        if b is None:
+            return
+        css = self.pos_css(b)
+        tbl = gf.find(f'.//{A}tbl')
+        if tbl is None:
+            css['height'] = px(b['h'])
+            uri = gf.find(f'.//{A}graphicData')
+            que = (uri.get('uri', '').rsplit('/', 1)[-1] if uri is not None else 'objeto')
+            out.append(f'<div class="el hueco" style="{css_str(css)}">Gráfico u objeto no importado ({esc(que)})</div>')
+            self.stats['gráficos u objetos (quedan como recuadro)'] += 1
+            return
+        cols = [int(c.get('w', '0')) * self.k for c in tbl.findall(f'{A}tblGrid/{A}gridCol')]
+        filas = []
+        for tr in tbl.findall(f'{A}tr'):
+            celdas = []
+            for tc in tr.findall(f'{A}tc'):
+                if es_verdad(tc.get('hMerge')) or es_verdad(tc.get('vMerge')):
+                    continue
+                attrs = ''
+                if tc.get('gridSpan'):
+                    attrs += f' colspan="{tc.get("gridSpan")}"'
+                if tc.get('rowSpan'):
+                    attrs += f' rowspan="{tc.get("rowSpan")}"'
+                ccss = {'border': '1px solid rgba(127,127,127,.45)'}
+                tcPr = tc.find(f'{A}tcPr')
+                if tcPr is not None:
+                    f = self.relleno(ctx, tcPr, None)
+                    if f:
+                        ccss['background'] = f
+                    ins = [int(tcPr.get(k, d)) * self.k for k, d in (('marT', 45720), ('marR', 91440), ('marB', 45720), ('marL', 91440))]
+                    ccss['padding'] = ' '.join(px(v) for v in ins)
+                tb = tc.find(f'{A}txBody')
+                r = self.texto(ctx, None, lay, tb, part, num) if tb is not None else None
+                interior = ''
+                if r:
+                    interior, dom = r[0], r[1]
+                    ccss.update(dom)
+                celdas.append(f'<td{attrs} style="{css_str(ccss)}">{interior}</td>')
+            filas.append(f'<tr style="height:{px(int(tr.get("h", "0")) * self.k)}">{"".join(celdas)}</tr>')
+        colgroup = ''.join(f'<col style="width:{px(w)}">' for w in cols)
+        out.append(f'<div class="el pptx" style="{css_str(css)}"><table style="border-collapse:collapse;width:100%;table-layout:fixed"><colgroup>{colgroup}</colgroup>{"".join(filas)}</table></div>')
+        self.stats['tablas'] += 1
+
+    # --- slides
+    def fondo(self, ctx, capas):
+        for part, tree in capas:
+            bg = tree.find(f'{P}cSld/{P}bg')
+            if bg is None:
+                continue
+            bgPr = bg.find(f'{P}bgPr')
+            if bgPr is not None:
+                bf = bgPr.find(f'{A}blipFill')
+                if bf is not None:
+                    b = bf.find(f'{A}blip')
+                    src = self.imagen(part, b.get(R + 'embed') if b is not None else None)
+                    if src:
+                        return 'img', src
+                f = self.relleno(ctx, bgPr, None)
+                if f:
+                    return 'css', f
+            ref = bg.find(f'{P}bgRef')
+            if ref is not None:
+                c = self.color(ctx, ref)
+                if c:
+                    return 'css', c
+        return 'css', self.esquema(ctx, 'bg1') or '#ffffff'
+
+    def notas(self, slide_part: str) -> str:
+        np_ = self.rel_de_tipo(slide_part, '/notesSlide')
+        if not np_ or np_ not in self.names:
+            return ''
+        tree = self.xml(np_)
+        ps = []
+        for sp in tree.iter(f'{P}sp'):
+            ph = sp.find(f'.//{P}nvPr/{P}ph')
+            if ph is None or ph.get('type', 'body') != 'body':
+                continue
+            for p in sp.iter(f'{A}p'):
+                t = ''.join(x.text or '' for x in p.iter(f'{A}t')).strip()
+                if t:
+                    ps.append(f'<p>{esc(t)}</p>')
+        return ''.join(ps)
+
+    def titulo_slide(self, tree, n: int) -> str:
+        """El título del placeholder; si no hay, el texto que está más arriba."""
+        arriba = (float('inf'), '')
+        for sp in tree.iter(f'{P}sp'):
+            t = ' '.join(''.join((x.text or '') if x.tag == f'{A}t' else ' ' for x in p.iter() if x.tag in (f'{A}t', f'{A}br'))
+                         for p in sp.iter(f'{A}p')).strip()
+            t = re.sub(r'\s+', ' ', t)
+            if not t:
+                continue
+            ph = sp.find(f'.//{P}nvPr/{P}ph')
+            if ph is not None and ph.get('type') in ('title', 'ctrTitle'):
+                return t[:70]
+            if re.fullmatch(r'[\d‹#›]+', t) or not re.search(r'[^\W\d_]{2}', t):
+                continue
+            off = sp.find(f'{P}spPr/{A}xfrm/{A}off')
+            y = int(off.get('y', 0)) if off is not None else float('inf')
+            if y < arriba[0] or not arriba[1]:
+                arriba = (y, t[:70])
+        return arriba[1] or f'Slide {n}'
+
+    def slide(self, part: str, n: int) -> str:
+        tree = self.xml(part)
+        lay_part = self.rel_de_tipo(part, '/slideLayout')
+        lay = self.xml(lay_part) if lay_part and lay_part in self.names else None
+        mas_part = self.rel_de_tipo(lay_part, '/slideMaster') if lay_part else None
+        if mas_part not in self.ctxs and mas_part:
+            self.ctxs[mas_part] = Contexto(self, mas_part)
+        ctx = self.ctxs.get(mas_part) or next(iter(self.ctxs.values()))
+        capas = [(part, tree)] + ([(lay_part, lay)] if lay is not None else []) + [(ctx.part, ctx.tree)]
+        tipo, valor = self.fondo(ctx, capas)
+        elementos = []
+        if tipo == 'img':
+            elementos.append(f'<img class="el cubrir" src="{esc(valor)}" alt="" style="left:0px;top:0px;width:{self.W}px;height:{self.H}px">')
+        T = (0, 1, 0, 1)
+        if lay is not None and (tree.get('showMasterSp') != '0'):
+            pass  # los dibujos fijos del layout se agregan abajo, antes del contenido de la slide
+        for fuente_part, fuente_tree in ([(lay_part, lay)] if lay is not None else []):
+            for n2 in fuente_tree.find(f'{P}cSld/{P}spTree') if fuente_tree.find(f'{P}cSld/{P}spTree') is not None else []:
+                if local(n2.tag) in ('sp', 'pic') and n2.find(f'.//{P}nvPr/{P}ph') is not None:
+                    continue
+                if local(n2.tag) in ('sp', 'pic', 'grpSp', 'cxnSp'):
+                    self.elemento(n2, fuente_part, fuente_tree, None, ctx, T, n, elementos)
+        sptree = tree.find(f'{P}cSld/{P}spTree')
+        for node in (sptree if sptree is not None else []):
+            self.elemento(node, part, tree, lay, ctx, T, n, elementos)
+        titulo = self.titulo_slide(tree, n)
+        if tree.get('show') == '0':
+            titulo = '(oculta) ' + titulo
+        estilo = f' style="background:{valor}"' if tipo == 'css' and valor != getattr(self, 'fondo_base', None) else ''
+        notas = self.notas(part)
+        cuerpo = '\n  '.join(elementos)
+        return f'<section class="slide" data-titulo="{esc(titulo)}"{estilo}>\n  {cuerpo}\n  <aside class="notas">{notas}</aside>\n</section>'
+
+    def convertir(self) -> str:
+        if not self.slides:
+            die('el archivo no tiene slides.')
+        primero = self.xml(self.slides[0])
+        lay_part = self.rel_de_tipo(self.slides[0], '/slideLayout')
+        mas_part = self.rel_de_tipo(lay_part, '/slideMaster') if lay_part else None
+        if mas_part:
+            self.ctxs[mas_part] = Contexto(self, mas_part)
+            ctx = self.ctxs[mas_part]
+            tipo, valor = self.fondo(ctx, [(mas_part, ctx.tree)])
+            self.fondo_base = valor if tipo == 'css' else None
+        secciones = [self.slide(p, i + 1) for i, p in enumerate(self.slides)]
+        return '\n\n'.join(secciones)
+
+
+def estilos_importados() -> str:
+    return """/* ===== ESTILOS · importados; los marcados «estilo:» aparecen en el selector de la barra ===== */
+.el.pptx p{margin:0}
+.slide a{color:var(--link)}
+/* estilo: Título */ .titulo{font:700 40px/1.2 var(--f-titulo);color:var(--texto)}
+/* estilo: Cuerpo */ .cuerpo{font:400 24px/1.35 var(--f-cuerpo);color:var(--texto)}
+/* estilo: Chico */ .chico{font:400 16px/1.35 var(--f-cuerpo);color:var(--texto);opacity:.7}
+/* estilo: Destacado */ .destacado{font:700 24px/1.3 var(--f-cuerpo);color:var(--acento)}
+/* estilo: [Fuente] */ .fuente{font:700 18px/1.2 var(--f-cuerpo);color:var(--link);text-decoration:underline}
+"""
+
+
+def importar_pptx(src: Path, carpeta: Path, titulo: str, sin_fuentes: bool) -> tuple[str, dict]:
+    imp = Pptx(src, carpeta)
+    secciones = imp.convertir()
+    ctx = next(iter(imp.ctxs.values()))
+    def hexo(nombre, defecto):
+        c = imp.esquema(ctx, nombre)
+        return c if c and re.fullmatch(r'#[0-9a-f]{6}', c) else defecto
+    fondo_base = getattr(imp, 'fondo_base', None)
+    num_color, num_tam = (imp.numero or (None, None))
+    tema = f""":root{{
+  --fondo: {fondo_base if fondo_base and re.fullmatch(r'#[0-9a-f]{6}', fondo_base) else hexo('bg1', '#ffffff')};
+  --texto: {hexo('tx1', '#111111')};
+  --acento: {hexo('accent1', '#2b6cb0')};
+  --acento2: {hexo('accent2', '#c05621')};
+  --link: {hexo('hlink', '#2b6cb0')};
+  --numero: {num_color if num_color and re.fullmatch(r'#[0-9a-f]{6}', num_color) else '#8a8f98'};
+  --numero-tam: {num_tam or '18px'};
+  --f-titulo: {familia_css(separar_peso(ctx.mayor)[0])};
+  --f-cuerpo: {familia_css(separar_peso(ctx.menor)[0])};
+}}"""
+    for face in (ctx.mayor, ctx.menor):
+        fam, peso = separar_peso(face)
+        imp.registrar(fam, peso or 400, False)
+        imp.registrar(fam, 700, False)
+    fuentes_css, faltan = ('', []) if sin_fuentes else bajar_fuentes(imp.familias, carpeta / 'fonts')
+    google = None
+    if sin_fuentes or faltan:
+        nombres = [f for f in (imp.familias if sin_fuentes else faltan) if f.lower() not in SISTEMA]
+        if nombres:
+            google = 'https://fonts.googleapis.com/css2?' + '&'.join('family=' + quote(f) for f in sorted(nombres)) + '&display=swap'
+    html_ = armar(titulo, secciones, archivo=f'{carpeta.name}.html', ancho=imp.W, alto=imp.H,
+                  fuentes_css=fuentes_css, tema_css=tema, estilos_css=estilos_importados(), google=google)
+    info = {'slides': len(imp.slides), 'lienzo': f'{imp.W}×{imp.H}', 'detalle': dict(imp.stats),
+            'fuentes locales': sorted(f for f in imp.familias if f.lower() not in SISTEMA and f not in faltan) if not sin_fuentes else [],
+            'fuentes sin bajar': faltan}
+    return html_, info
+
+
+def importar_pdf(src: Path, carpeta: Path, titulo: str, tema: str) -> tuple[str, dict]:
+    if not shutil.which('pdftoppm'):
+        die('para importar PDF hace falta pdftoppm (paquete poppler-utils).')
+    out = subprocess.run(['pdfinfo', str(src)], capture_output=True, text=True).stdout
+    paginas = int(re.search(r'Pages:\s+(\d+)', out).group(1))
+    m = re.search(r'Page size:\s+([\d.]+) x ([\d.]+)', out)
+    wpt, hpt = float(m.group(1)), float(m.group(2))
+    W = 1280
+    H = round(W * hpt / wpt)
+    dpi = max(72, round(W * 1.25 / (wpt / 72)))
+    img_dir = carpeta / 'img'
+    img_dir.mkdir(parents=True, exist_ok=True)
+    from PIL import Image
+    secciones = []
+    with tempfile.TemporaryDirectory() as td:
+        subprocess.run(['pdftoppm', '-r', str(dpi), '-png', str(src), f'{td}/p'], check=True)
+        pngs = sorted(Path(td).glob('p-*.png'))
+        for i, png in enumerate(pngs, 1):
+            nombre = f'pagina-{i:02d}.webp'
+            Image.open(png).convert('RGB').save(img_dir / nombre, 'WEBP', quality=88)
+            txt = subprocess.run(['pdftotext', '-f', str(i), '-l', str(i), '-layout', str(src), '-'], capture_output=True, text=True).stdout if shutil.which('pdftotext') else ''
+            lineas = [re.sub(r'\s+', ' ', l).strip() for l in txt.splitlines()]
+            lineas = [l for l in lineas if l]
+            con_letras = [l for l in lineas if re.search(r'[^\W\d_]{2}', l)]
+            titulo_p = con_letras[0][:70] if con_letras else f'Página {i}'
+            notas = ('<p><i>Texto de la página, importado del PDF:</i></p>' + ''.join(f'<p>{esc(l)}</p>' for l in lineas)) if lineas else ''
+            secciones.append(f'<section class="slide" data-titulo="{esc(titulo_p)}">\n  <img class="el" src="img/{nombre}" alt="Página {i}" style="left:0px;top:0px;width:{W}px">\n  <aside class="notas">{notas}</aside>\n</section>')
+    tdir = tema_dir(tema)
+    copiar_fuentes(tdir, carpeta)
+    meta = json.loads((tdir / 'tema.json').read_text(encoding='utf-8'))
+    html_ = armar(titulo, '\n\n'.join(secciones), archivo=f'{carpeta.name}.html', ancho=W, alto=H,
+                  fuentes_css=(tdir / 'fuentes.css').read_text(encoding='utf-8'), tema_css=(tdir / 'tema.css').read_text(encoding='utf-8'),
+                  estilos_css=(tdir / 'estilos.css').read_text(encoding='utf-8'), google=meta.get('google'))
+    return html_, {'slides': paginas, 'lienzo': f'{W}×{H}', 'detalle': {'cada página es una imagen de fondo': paginas}}
+
+
+def cmd_importar(a) -> None:
+    src = Path(a.archivo).expanduser().resolve()
+    if not src.exists():
+        die(f'no existe {src}')
+    ext = src.suffix.lower()
+    if ext not in ('.pptx', '.pdf'):
+        die('importo .pptx (PowerPoint, o Google Slides bajado como PowerPoint) o .pdf.')
+    carpeta = Path(a.salida).expanduser().resolve() if a.salida else src.with_name(f'{src.stem}-diapo')
+    nombre = re.sub(r'[^\w.-]+', '-', carpeta.name).strip('-') or 'presentacion'
+    archivo = carpeta / f'{nombre}.html'
+    if archivo.exists() and not a.pisar:
+        die(f'ya existe {archivo}; usá --pisar para reemplazarla.')
+    carpeta.mkdir(parents=True, exist_ok=True)
+    titulo = a.titulo or src.stem
+    if ext == '.pptx':
+        html_, info = importar_pptx(src, carpeta, titulo, a.sin_fuentes)
+    else:
+        html_, info = importar_pdf(src, carpeta, titulo, a.tema)
+    html_ = html_.replace(f'diapo ver {carpeta.name}.html', f'diapo ver {archivo.name}')
+    if archivo.exists():
+        respaldar(archivo)
+    escribir(archivo, html_)
+    carpeta_oculta(carpeta)
+    print(f'Importada: {archivo}')
+    print(f'  {info["slides"]} slides, lienzo {info["lienzo"]}')
+    for k, v in sorted(info.get('detalle', {}).items()):
+        print(f'  {k}: {v}')
+    if info.get('fuentes locales'):
+        print(f'  tipografías guardadas en fonts/: {", ".join(info["fuentes locales"])}')
+    if info.get('fuentes sin bajar'):
+        print(f'  tipografías que no pude bajar (se ven con otra parecida): {", ".join(info["fuentes sin bajar"])}')
+    print(f'Revisala con: diapo revisar {archivo}')
+    print(f'Abrila con:   diapo ver {archivo}')
+
+
+# ----------------------------------------------------------------------------
+# chat: Claude Code sin ventana detrás de `diapo ver`, con la cuenta de quien lo usa
+# ----------------------------------------------------------------------------
+
+class Estructura(HTMLParser):
+    """Líneas del archivo donde empieza y termina cada slide, y dónde está cada elemento."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.en_deck = False
+        self.pila: list[str] = []
+        self.slides: list[dict] = []
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if not self.en_deck:
+            if tag == 'div' and d.get('id') == 'deck':
+                self.en_deck, self.pila = True, []
+            return
+        clases = (d.get('class') or '').split()
+        linea = self.getpos()[0]
+        if not self.pila and tag == 'section' and 'slide' in clases:
+            self.slides.append({'ini': linea, 'fin': linea, 'titulo': d.get('data-titulo', ''), 'els': []})
+        elif len(self.pila) == 1 and self.slides and 'el' in clases:
+            self.slides[-1]['els'].append({'linea': linea, 'tag': tag, 'clases': ' '.join(c for c in clases if c != 'el')})
+        if tag not in VACIOS:
+            self.pila.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.en_deck or tag in VACIOS:
+            return
+        if not self.pila:
+            self.en_deck = tag != 'div'
+            return
+        while self.pila and self.pila.pop() != tag:
+            pass
+        if not self.pila and tag == 'section' and self.slides:
+            self.slides[-1]['fin'] = self.getpos()[0]
+
+
+def contexto_chat(deck: Path, slide, elemento) -> str:
+    """Lo que Claude necesita saber para entender «esto» o «esta slide»."""
+    e = Estructura()
+    e.feed(deck.read_text(encoding='utf-8', errors='replace'))
+    partes = [f'{deck.name} tiene {len(e.slides)} slides.']
+    if isinstance(slide, int) and 1 <= slide <= len(e.slides):
+        s = e.slides[slide - 1]
+        partes.append(f'Está mirando la slide {slide}, «{s["titulo"]}», líneas {s["ini"]} a {s["fin"]}.')
+        if isinstance(elemento, int) and 0 <= elemento < len(s['els']):
+            el = s['els'][elemento]
+            partes.append(f'Tiene elegido el elemento de la línea {el["linea"]} (<{el["tag"]} class="{("el " + el["clases"]).strip()}">).')
+        else:
+            partes.append('No tiene ningún elemento elegido.')
+    return '[Panel de diapo: ' + ' '.join(partes) + ']'
+
+
+def reglas_chat(deck: Path) -> str:
+    texto = deck.read_text(encoding='utf-8', errors='replace')
+    W, H = medidas(texto)
+    m = re.search(r'<style id="estilos">(.*?)</style>', texto, re.S)
+    est = m.group(1) if m else ''
+    m = re.search(r'<style id="tema">(.*?)</style>', texto, re.S)
+    tem = m.group(1) if m else ''
+    estilos = ', '.join(f'{n} (.{c})' for n, c in re.findall(r'/\*\s*estilo:\s*([^*]+?)\s*\*/\s*\.([\w-]+)', est)) or 'ninguno'
+    fondos = ', '.join(f'{n} (.slide.{c})' for n, c in re.findall(r'/\*\s*fondo:\s*([^*]+?)\s*\*/\s*\.slide\.([\w-]+)', est)) or 'ninguno'
+    colores = ', '.join(f'var(--{n}) {v}' for n, v in re.findall(r'--([\w-]+)\s*:\s*(#[0-9a-fA-F]{3,8})\s*;', tem)) or 'ninguno'
+    return f"""Estás en el panel de chat de diapo, al costado de la presentación que la persona edita en el navegador. Trabajás sobre un solo archivo: {deck.name}, en la carpeta actual. Cada vez que lo guardás, la página se actualiza sola: Matías ve el cambio enseguida y lo puede deshacer con Ctrl+Z.
+
+Cada mensaje empieza con un contexto entre corchetes: en qué slide está (número, título y líneas del archivo) y qué elemento tiene elegido. «Esto», «acá» o «esta slide» se refieren a eso.
+
+Formato del archivo:
+- <div id="deck" data-ancho="{W}" data-alto="{H}"> contiene un <section class="slide" data-titulo="…"> por slide, en orden; la primera es la slide 1.
+- Lo movible es hijo directo de la slide, con la clase el y style="left:…px;top:…px;width:…px" sobre un lienzo de {W}×{H}. El orden en el archivo es el orden de apilado.
+- Textos: <div class="el ESTILO">. Links: <a class="el fuente" href="…" target="_blank" rel="noopener">[sitio]</a>. Imágenes: <img class="el" src="img/…" alt="">. Recuadro para completar: <div class="el hueco" style="…;height:…px">qué va</div>.
+- Notas del orador: <aside class="notas"> al final de cada slide.
+- Estilos del tema: {estilos}. Fondos de slide: {fondos}. Colores: {colores}. Usá estas clases y variables en vez de tipografías o colores sueltos.
+- No toques <style id="motor-css">, <script id="motor"> ni <style id="fuentes">.
+
+Cómo trabajar:
+- Leé con Read solo las líneas que necesitás (offset y limit) y editá con Edit, con cambios mínimos. No reescribas el archivo.
+- Para una slide nueva, copiá la estructura de una parecida de la misma presentación.
+- Si cambian tamaños, posiciones o textos largos, verificá con `diapo revisar {deck.name} --slides N` y mirá la captura .diapo/revision/slide-NN.png con Read. Para un cambio chico de texto no hace falta.
+- Los pedidos que dejó con el botón Pedido se ven con `diapo pedidos {deck.name}`. Al resolver uno, borrá su atributo data-pedido.
+- Podés leer otros archivos si te los nombra, pero solo podés modificar esta presentación. No podés bajar imágenes: si falta una, dejá un hueco que diga qué va.
+- Contenido: seguí el tono del resto de la presentación, frases cortas, sin aforismos. Los datos van con su fuente, en las notas o en un [link].
+
+Respondé en español, en una o dos líneas: qué cambiaste y en qué slide. Si algo no se pudo, decilo."""
+
+
+def paso_chat(nombre: str, entrada: dict, deck: Path) -> str:
+    """Lo que está haciendo Claude, en pocas palabras, para mostrar en el panel."""
+    f = str(entrada.get('file_path') or entrada.get('path') or '')
+    base = Path(f).name if f else ''
+    if nombre == 'Read':
+        m = re.search(r'slide-(\d+)\.png$', f)
+        if m:
+            return f'Mira la captura de la slide {int(m.group(1))}'
+        if base == deck.name:
+            off, lim = entrada.get('offset'), entrada.get('limit')
+            return f'Lee las líneas {off} a {off + lim - 1}' if isinstance(off, int) and isinstance(lim, int) else 'Lee la presentación'
+        return f'Lee {base}'
+    if nombre in ('Edit', 'MultiEdit'):
+        return 'Edita la presentación' if base == deck.name else f'Quiere editar {base}'
+    if nombre == 'Write':
+        return f'Quiere escribir {base}'
+    if nombre == 'Bash':
+        c = str(entrada.get('command') or '').strip()
+        if c.startswith('diapo revisar'):
+            m = re.search(r'--slides\s+(\S+)', c)
+            return 'Revisa cómo quedó' + (f' la slide {m.group(1)}' if m else '')
+        if c.startswith('diapo pedidos'):
+            return 'Lee los pedidos'
+        if re.match(r'(grep|rg|sed -n|head|tail|cat|wc|ls)\b', c):
+            return 'Busca en el archivo'
+        return f'Quiere correr: {c[:60]}'
+    if nombre in ('Grep', 'Glob'):
+        return 'Busca en el archivo'
+    if nombre == 'WebSearch':
+        return f'Busca en la web: {str(entrada.get("query", ""))[:60]}'
+    if nombre == 'WebFetch':
+        return f'Lee {urlparse(str(entrada.get("url", ""))).netloc or "una página"}'
+    return nombre
+
+
+class Chat:
+    """Una conversación con Claude Code sin ventana para una presentación: un proceso que recibe los
+    mensajes por stdin (stream-json). Solo puede editar ese archivo y correr diapo revisar/pedidos."""
+    SIN_HEREDAR = ('CLAUDE_PID', 'CLAUDE_EFFORT', 'AI_AGENT', 'TMUX', 'TMUX_PANE')
+
+    def __init__(self, deck: Path, modelo: str | None):
+        self.deck, self.modelo = deck, modelo
+        self.proc = None
+        self.ocupado = False
+        self.pendiente = None
+        self.retoma = False
+        self.vio_inicio = False
+        self.t0 = 0.0
+        self.error = ''
+        self.modelo_real = None
+        self.oyentes: list[queue.Queue] = []
+        self.candado = threading.Lock()
+        self.estado = carpeta_oculta(deck.parent) / 'chat.json'
+        try:
+            self.sesion = json.loads(self.estado.read_text(encoding='utf-8')).get(deck.name)
+        except (OSError, ValueError):
+            self.sesion = None
+
+    def guardar_sesion(self) -> None:
+        try:
+            d = json.loads(self.estado.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            d = {}
+        if self.sesion:
+            d[self.deck.name] = self.sesion
+        else:
+            d.pop(self.deck.name, None)
+        self.estado.write_text(json.dumps(d), encoding='utf-8')
+
+    def emitir(self, ev: dict) -> None:
+        for q in list(self.oyentes):
+            q.put(ev)
+
+    def arrancar(self) -> None:
+        cmd = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+               '--safe-mode', '--permission-mode', 'default',
+               '--allowedTools', f'Edit(./{self.deck.name})', 'Bash(diapo revisar:*)', 'Bash(diapo pedidos:*)',
+               '--append-system-prompt', reglas_chat(self.deck)]
+        if self.modelo:
+            cmd += ['--model', self.modelo]
+        self.retoma = bool(self.sesion)
+        if self.sesion:
+            cmd += ['--resume', self.sesion]
+        env = {k: v for k, v in os.environ.items()
+               if not (k == 'CLAUDECODE' or k.startswith(('CLAUDE_CODE_', 'ORCA_', 'AGENTDECK')) or k in self.SIN_HEREDAR)}
+        self.vio_inicio, self.error = False, ''
+        self.proc = subprocess.Popen(cmd, cwd=self.deck.parent, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, encoding='utf-8', bufsize=1)
+        threading.Thread(target=self.leer, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self.leer_error, args=(self.proc,), daemon=True).start()
+
+    def leer_error(self, proc) -> None:
+        for line in proc.stderr:
+            self.error = (self.error + line)[-800:]
+
+    def leer(self, proc) -> None:
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if proc is self.proc:
+                self.procesar(ev)
+        proc.wait()
+        if proc is not self.proc or not self.ocupado:
+            if proc is self.proc:
+                self.proc = None
+            return
+        self.proc = None
+        if self.retoma and not self.vio_inicio and self.pendiente:
+            self.sesion = None
+            self.guardar_sesion()
+            self.emitir({'tipo': 'info', 'texto': 'No pude retomar la conversación anterior; empiezo una nueva.'})
+            with self.candado:
+                self.arrancar()
+                self.escribir(self.pendiente)
+            return
+        self.ocupado, self.pendiente = False, None
+        detalle = self.error.strip().splitlines()[-1] if self.error.strip() else ''
+        self.emitir({'tipo': 'error', 'texto': 'Claude se cerró antes de terminar.' + (f' ({detalle[:200]})' if detalle else '')})
+
+    def procesar(self, ev: dict) -> None:
+        t, st = ev.get('type'), ev.get('subtype')
+        if t == 'system' and st == 'init':
+            self.vio_inicio = True
+            sid = ev.get('session_id')
+            if sid and sid != self.sesion:
+                self.sesion = sid
+                self.guardar_sesion()
+            if ev.get('model') and ev['model'] != self.modelo_real:
+                self.modelo_real = ev['model']
+                self.emitir({'tipo': 'modelo', 'modelo': self.modelo_real})
+        elif t == 'system' and st == 'permission_denied':
+            self.emitir({'tipo': 'paso', 'texto': 'Quiso hacer algo sin permiso y lo frené'})
+        elif t == 'assistant':
+            for c in (ev.get('message') or {}).get('content') or []:
+                if c.get('type') == 'text' and (c.get('text') or '').strip():
+                    self.emitir({'tipo': 'texto', 'texto': c['text'].strip()})
+                elif c.get('type') == 'tool_use':
+                    self.emitir({'tipo': 'paso', 'texto': paso_chat(c.get('name', ''), c.get('input') or {}, self.deck)})
+        elif t == 'result':
+            self.ocupado, self.pendiente = False, None
+            ok = st == 'success' and not ev.get('is_error')
+            fin = {'tipo': 'fin', 'ok': ok, 'segundos': round(time.time() - self.t0, 1)}
+            if not ok:
+                fin['texto'] = str(ev.get('result') or st or 'error')[:300]
+            self.emitir(fin)
+
+    def escribir(self, texto: str) -> None:
+        msg = {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': texto}]}}
+        self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + '\n')
+        self.proc.stdin.flush()
+
+    def enviar(self, texto: str, slide, elemento) -> tuple[int, dict]:
+        if not shutil.which('claude'):
+            return 503, {'error': 'No encuentro el comando claude.'}
+        with self.candado:
+            if self.ocupado:
+                return 409, {'error': 'Claude todavía está trabajando en el pedido anterior.'}
+            respaldar(self.deck)
+            msg = contexto_chat(self.deck, slide, elemento) + '\n\n' + texto
+            self.ocupado, self.pendiente, self.t0 = True, msg, time.time()
+            for _ in range(2):
+                if self.proc is None or self.proc.poll() is not None:
+                    self.arrancar()
+                try:
+                    self.escribir(msg)
+                    break
+                except (BrokenPipeError, OSError):
+                    self.proc = None
+            else:
+                self.ocupado, self.pendiente = False, None
+                return 500, {'error': 'No pude hablar con Claude Code.'}
+        print(f'  {datetime.now():%H:%M:%S} pedido a Claude: {texto[:70]}')
+        self.emitir({'tipo': 'pensando'})
+        return 202, {'ok': True}
+
+    def parar(self, avisar: bool = True) -> None:
+        with self.candado:
+            p, self.proc = self.proc, None
+            self.ocupado, self.pendiente = False, None
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        if avisar:
+            self.emitir({'tipo': 'parado'})
+
+    def nueva(self) -> None:
+        self.parar(avisar=False)
+        self.sesion = None
+        self.guardar_sesion()
+        self.emitir({'tipo': 'nueva'})
+
+
+# ----------------------------------------------------------------------------
+# ver: servidor local con guardado y aviso de cambios
+# ----------------------------------------------------------------------------
+
+def huella(p: Path) -> str:
+    return hashlib.sha1(p.read_bytes()).hexdigest()[:16] if p.exists() else ''
+
+
+class Servidor(SimpleHTTPRequestHandler):
+    raiz: Path = Path('.')
+    modelo: str | None = None
+    candado = threading.Lock()
+    candado_chats = threading.Lock()
+    chats: dict = {}
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def propio(self) -> bool:
+        """Solo atiende pedidos de esta misma página: corta el acceso desde otro sitio abierto en el navegador."""
+        puerto = self.server.server_address[1]
+        propios = {f'127.0.0.1:{puerto}', f'localhost:{puerto}', f'[::1]:{puerto}'}
+        if (self.headers.get('Host') or '') not in propios:
+            return False
+        origen = self.headers.get('Origin')
+        return not origen or origen.removeprefix('http://') in propios
+
+    def chat(self, p: Path) -> Chat:
+        with Servidor.candado_chats:
+            c = Servidor.chats.get(p)
+            if c is None:
+                c = Servidor.chats[p] = Chat(p, Servidor.modelo)
+            return c
+
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-store')
+        super().end_headers()
+
+    def archivo(self, q) -> Path | None:
+        nombre = (q.get('archivo') or [''])[0]
+        p = (self.raiz / nombre).resolve()
+        if self.raiz not in p.parents or p.suffix.lower() not in ('.html', '.htm'):
+            return None
+        return p
+
+    def json(self, code: int, obj: dict) -> None:
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if not self.propio():
+            return self.json(403, {'error': 'origen'})
+        u = urlparse(self.path)
+        if u.path == '/__diapo/estado':
+            p = self.archivo(parse_qs(u.query))
+            if not p or not p.exists():
+                return self.json(404, {'error': 'archivo'})
+            c = self.chat(p)
+            return self.json(200, {'hash': huella(p), 'version': VERSION, 'chat': bool(shutil.which('claude')),
+                                   'chat_ocupado': c.ocupado, 'modelo': c.modelo_real or Servidor.modelo or ''})
+        if u.path == '/__diapo/eventos':
+            p = self.archivo(parse_qs(u.query))
+            if not p:
+                return self.json(404, {'error': 'archivo'})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            cola: queue.Queue = queue.Queue()
+            chat = self.chat(p)
+            chat.oyentes.append(cola)
+            ultimo, firma, ping = huella(p), None, time.time()
+            try:
+                while True:
+                    try:
+                        ev = cola.get(timeout=0.5)
+                        self.wfile.write(f'event: chat\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n'.encode())
+                        self.wfile.flush()
+                    except queue.Empty:
+                        pass
+                    st = p.stat() if p.exists() else None
+                    f = (st.st_mtime_ns, st.st_size) if st else None
+                    if f != firma:
+                        firma = f
+                        h = huella(p)
+                        if h and h != ultimo:
+                            ultimo = h
+                            self.wfile.write(f'event: cambio\ndata: {json.dumps({"hash": h})}\n\n'.encode())
+                            self.wfile.flush()
+                    if time.time() - ping > 15:
+                        ping = time.time()
+                        self.wfile.write(b': sigo\n\n')
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                if cola in chat.oyentes:
+                    chat.oyentes.remove(cola)
+        return super().do_GET()
+
+    def cuerpo(self) -> bytes:
+        return self.rfile.read(int(self.headers.get('Content-Length') or 0))
+
+    def do_POST(self):
+        if not self.propio():
+            return self.json(403, {'error': 'origen'})
+        u = urlparse(self.path)
+        if not u.path.startswith('/__diapo/'):
+            return self.json(404, {'error': 'ruta'})
+        q = parse_qs(u.query)
+        p = self.archivo(q)
+        if not p:
+            return self.json(403, {'error': 'archivo'})
+        if u.path == '/__diapo/guardar':
+            cuerpo = self.cuerpo()
+            base = (q.get('base') or [''])[0]
+            forzar = (q.get('forzar') or ['0'])[0] == '1'
+            with self.candado:
+                actual = huella(p)
+                if base and actual and base != actual and not forzar:
+                    return self.json(409, {'hash': actual})
+                respaldar(p)
+                tmp = p.with_name(f'.{p.name}.tmp')
+                tmp.write_bytes(cuerpo)
+                os.replace(tmp, p)
+                nuevo = huella(p)
+            print(f'  {datetime.now():%H:%M:%S} guardado {p.name}')
+            return self.json(200, {'hash': nuevo})
+        if u.path == '/__diapo/chat':
+            try:
+                d = json.loads(self.cuerpo() or b'{}')
+            except ValueError:
+                return self.json(400, {'error': 'no entendí el pedido'})
+            texto = str(d.get('texto') or '').strip()
+            if not texto:
+                return self.json(400, {'error': 'el mensaje está vacío'})
+            return self.json(*self.chat(p).enviar(texto, d.get('slide'), d.get('elemento')))
+        if u.path == '/__diapo/chat/parar':
+            self.cuerpo()
+            self.chat(p).parar()
+            return self.json(200, {'ok': True})
+        if u.path == '/__diapo/chat/nueva':
+            self.cuerpo()
+            self.chat(p).nueva()
+            return self.json(200, {'ok': True})
+        return self.json(404, {'error': 'ruta'})
+
+
+def cmd_ver(a) -> None:
+    deck = resolver_deck(a.archivo)
+    Servidor.raiz = deck.parent.resolve()
+    Servidor.modelo = getattr(a, 'modelo', None)
+    handler = lambda *args, **kw: Servidor(*args, directory=str(Servidor.raiz), **kw)
+    srv = None
+    for puerto in range(a.puerto, a.puerto + 30):
+        try:
+            srv = ThreadingHTTPServer(('127.0.0.1', puerto), handler)
+            break
+        except OSError:
+            continue
+    if srv is None:
+        die('no encontré un puerto libre.')
+    srv.daemon_threads = True
+    url = f'http://127.0.0.1:{srv.server_address[1]}/{quote(deck.name)}'
+    texto = deck.read_text(encoding='utf-8', errors='replace')
+    print(f'diapo sirviendo {deck}')
+    print(f'  {url}')
+    if not es_diapo(texto):
+        print('  (este archivo tiene un motor viejo: se ve igual, pero guarda con el diálogo del navegador)')
+    print('  Ctrl+S en la página guarda en el archivo. Si Claude lo cambia, la página se actualiza sola.')
+    if shutil.which('claude'):
+        print(f'  Chat con Claude: tecla C o botón «Claude». Usa Claude Code con tu cuenta{", modelo " + a.modelo if getattr(a, "modelo", None) else ""}.')
+    else:
+        print('  (sin chat: no encuentro el comando claude)')
+    print('  Ctrl+C acá para cerrar.')
+    if not a.no_abrir:
+        threading.Timer(0.4, lambda: webbrowser.open(url + ('?editar' if a.editar else ''))).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print('\ncerrado.')
+    finally:
+        for c in list(Servidor.chats.values()):
+            c.parar(avisar=False)
+
+
+# ----------------------------------------------------------------------------
+# revisar, pdf (con Chromium sin ventana)
+# ----------------------------------------------------------------------------
+
+CHEQUEO_JS = r"""
+({W, H, sel}) => {
+  const out = [];
+  const slides = [...document.querySelectorAll('#deck > section.slide')];
+  const deckR = document.getElementById('deck').getBoundingClientRect();
+  const k = deckR.width / W || 1;
+  const rects = el => {
+    const out = [], tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let t;
+    while ((t = tw.nextNode())) {
+      if (!t.nodeValue.trim()) continue;
+      const r = document.createRange(); r.selectNodeContents(t);
+      for (const x of r.getClientRects()) if (x.width > 1 && x.height > 1) out.push({l: (x.left - deckR.left) / k, t: (x.top - deckR.top) / k, r: (x.right - deckR.left) / k, b: (x.bottom - deckR.top) / k});
+    }
+    return out;
+  };
+  const corto = el => ((el.innerText || el.textContent || '').trim() || el.getAttribute('src') || el.className).replace(/\s+/g, ' ').slice(0, 60);
+  const cruce = (a, b) => Math.min(a.r, b.r) - Math.max(a.l, b.l) > 3 && Math.min(a.b, b.b) - Math.max(a.t, b.t) > 3;
+  slides.forEach((s, i) => {
+    const n = i + 1;
+    if (sel && !sel.includes(n)) return;
+    slides.forEach(o => o.classList.toggle('actual', o === s));
+    const els = [...s.querySelectorAll(':scope > .el')];
+    const textos = [];
+    els.forEach(el => {
+      const L = el.offsetLeft, T = el.offsetTop, w = el.offsetWidth, h = el.offsetHeight;
+      const esTexto = el.tagName !== 'IMG' && !el.classList.contains('hueco') && (el.textContent || '').trim();
+      if (esTexto) {
+        const rs = rects(el);
+        textos.push({el, rs});
+        if (!el.classList.contains('sangrado') && rs.some(x => x.l < -2 || x.t < -2 || x.r > W + 2 || x.b > H + 2)) out.push({n, tipo: 'texto fuera del lienzo', txt: corto(el)});
+        if (el.scrollWidth > el.clientWidth + 2 && getComputedStyle(el).whiteSpace !== 'nowrap') out.push({n, tipo: 'texto más ancho que su caja', txt: corto(el), det: `${el.scrollWidth} > ${el.clientWidth} px`});
+        if (el.style.height && el.scrollHeight > el.clientHeight + 3) out.push({n, tipo: 'texto más alto que su caja', txt: corto(el), det: `${el.scrollHeight} > ${el.clientHeight} px`});
+      } else if (!el.classList.contains('sangrado')) {
+        const ix = Math.max(0, Math.min(L + w, W) - Math.max(L, 0)), iy = Math.max(0, Math.min(T + h, H) - Math.max(T, 0));
+        const dentro = (ix * iy) / Math.max(w * h, 1);
+        if (dentro < 0.75) out.push({n, tipo: 'sale del lienzo', txt: corto(el), det: `${Math.round((1 - dentro) * 100)}% afuera`});
+      }
+      if (el.tagName === 'IMG' && (!el.complete || el.naturalWidth === 0)) out.push({n, tipo: 'imagen que no carga', txt: el.getAttribute('src') || ''});
+      if (el.classList.contains('hueco')) out.push({n, tipo: 'recuadro para completar', txt: corto(el)});
+      if (el.dataset.pedido) out.push({n, tipo: 'pedido a Claude', txt: corto(el), det: el.dataset.pedido});
+    });
+    if (s.dataset.pedido) out.push({n, tipo: 'pedido a Claude', txt: '(toda la slide)', det: s.dataset.pedido});
+    for (let a = 0; a < textos.length; a++) for (let b = a + 1; b < textos.length; b++) {
+      if (textos[a].rs.some(ra => textos[b].rs.some(rb => cruce(ra, rb)))) out.push({n, tipo: 'textos que se pisan', txt: `${corto(textos[a].el).slice(0, 28)} / ${corto(textos[b].el).slice(0, 28)}`});
+    }
+  });
+  const fuentes = [...document.fonts].filter(f => f.status === 'error').map(f => `${f.family} ${f.weight} ${f.style}`);
+  return {problemas: out, fuentes, titulos: slides.map(s => s.dataset.titulo || '')};
+}
+"""
+
+
+def rango(texto: str | None, total: int) -> list[int] | None:
+    if not texto:
+        return None
+    out = set()
+    for parte in texto.split(','):
+        parte = parte.strip()
+        if '-' in parte:
+            a, b = parte.split('-', 1)
+            out.update(range(int(a), int(b) + 1))
+        elif parte:
+            out.add(int(parte))
+    return sorted(n for n in out if 1 <= n <= total)
+
+
+def abrir_navegador(deck: Path, ancho: int, alto: int):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        die('para revisar y exportar hace falta Playwright para Python (pip install playwright).')
+    pw = sync_playwright().start()
+    b = pw.chromium.launch()
+    pg = b.new_page(viewport={'width': ancho, 'height': alto})
+    errores = []
+    pg.on('pageerror', lambda e: errores.append(str(e)))
+    pg.goto(deck.as_uri())
+    pg.wait_for_timeout(400)
+    pg.evaluate('Promise.all([...document.fonts].map(f => f.load().catch(() => null)))')
+    pg.evaluate('Promise.all([...document.images].map(i => i.decode ? i.decode().catch(() => null) : null))')
+    pg.wait_for_timeout(200)
+    return pw, b, pg, errores
+
+
+def medidas(texto: str) -> tuple[int, int]:
+    m = re.search(r'<div id="deck"[^>]*data-ancho="(\d+)"[^>]*data-alto="(\d+)"', texto)
+    return (int(m.group(1)), int(m.group(2))) if m else (1280, 720)
+
+
+def cmd_revisar(a) -> None:
+    deck = resolver_deck(a.archivo)
+    texto = deck.read_text(encoding='utf-8', errors='replace')
+    W, H = medidas(texto)
+    salida = Path(a.salida).expanduser().resolve() if a.salida else carpeta_oculta(deck.parent, 'revision')
+    salida.mkdir(parents=True, exist_ok=True)
+    pw, b, pg, errores = abrir_navegador(deck, W, H)
+    try:
+        total = pg.evaluate("document.querySelectorAll('#deck > section.slide').length")
+        sel = rango(a.slides, total)
+        res = pg.evaluate(CHEQUEO_JS, {'W': W, 'H': H, 'sel': sel})
+        pg.add_style_tag(content='[data-ui]{display:none!important}')
+        capturas = []
+        if not a.sin_capturas:
+            for f in salida.glob('slide-*.png'):
+                f.unlink()
+            for n in (sel or range(1, total + 1)):
+                pg.evaluate(f'(window.diapo || window.deckAPI).go({n - 1})')
+                pg.wait_for_timeout(60)
+                f = salida / f'slide-{n:02d}.png'
+                pg.screenshot(path=str(f))
+                capturas.append((n, f))
+    finally:
+        b.close()
+        pw.stop()
+    hojas = hacer_hojas(capturas, res['titulos'], salida) if capturas else []
+    if a.json:
+        print(json.dumps({'archivo': str(deck), 'slides': total, 'problemas': res['problemas'], 'fuentes_con_error': res['fuentes'],
+                          'errores_js': errores, 'capturas': [str(f) for _, f in capturas], 'hojas': [str(h) for h in hojas]}, ensure_ascii=False, indent=1))
+        return
+    print(f'{deck.name}: {total} slides, lienzo {W}×{H}')
+    graves = [p for p in res['problemas'] if p['tipo'] not in ('recuadro para completar', 'pedido a Claude')]
+    avisos = [p for p in res['problemas'] if p not in graves]
+    for p in graves:
+        print(f'  slide {p["n"]:>2} · {p["tipo"]}: {p["txt"]}' + (f' ({p["det"]})' if p.get('det') else ''))
+    if not graves:
+        print('  sin desbordes, superposiciones ni imágenes rotas')
+    for p in avisos:
+        print(f'  slide {p["n"]:>2} · {p["tipo"]}: {p["txt"]}' + (f' → {p["det"]}' if p.get('det') else ''))
+    for f in res['fuentes']:
+        print(f'  tipografía que no cargó: {f}')
+    for e in errores:
+        print(f'  error de JavaScript: {e}')
+    if capturas:
+        print(f'Capturas: {salida}/slide-NN.png')
+        for h in hojas:
+            print(f'Hoja de contactos: {h}')
+
+
+def hacer_hojas(capturas, titulos, salida: Path, por_hoja: int = 12) -> list[Path]:
+    from PIL import Image, ImageDraw, ImageFont
+    for h in salida.glob('hoja-*.png'):
+        h.unlink()
+    try:
+        font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 15)
+    except Exception:
+        font = ImageFont.load_default()
+    hojas = []
+    for k in range(0, len(capturas), por_hoja):
+        grupo = capturas[k:k + por_hoja]
+        tw = 460
+        ims = []
+        for n, f in grupo:
+            im = Image.open(f).convert('RGB')
+            th = round(im.height * tw / im.width)
+            ims.append((n, im.resize((tw, th))))
+        th = max(im.height for _, im in ims)
+        cols = 3
+        filas = math.ceil(len(ims) / cols)
+        hoja = Image.new('RGB', (cols * (tw + 12) + 12, filas * (th + 40) + 12), (60, 60, 66))
+        d = ImageDraw.Draw(hoja)
+        for j, (n, im) in enumerate(ims):
+            x = 12 + (j % cols) * (tw + 12)
+            y = 12 + (j // cols) * (th + 40)
+            hoja.paste(im, (x, y))
+            t = f'{n} · {titulos[n - 1] if n - 1 < len(titulos) else ""}'
+            d.text((x, y + th + 8), t[:52], fill=(235, 235, 235), font=font)
+        p = salida / f'hoja-{k // por_hoja + 1}.png'
+        hoja.save(p)
+        hojas.append(p)
+    return hojas
+
+
+def cmd_pdf(a) -> None:
+    deck = resolver_deck(a.archivo)
+    W, H = medidas(deck.read_text(encoding='utf-8', errors='replace'))
+    out = Path(a.salida).expanduser().resolve() if a.salida else deck.with_suffix('.pdf')
+    pw, b, pg, errores = abrir_navegador(deck, W, H)
+    try:
+        pg.pdf(path=str(out), prefer_css_page_size=True, print_background=True)
+    finally:
+        b.close()
+        pw.stop()
+    paginas = ''
+    if shutil.which('pdfinfo'):
+        m = re.search(r'Pages:\s+(\d+)', subprocess.run(['pdfinfo', str(out)], capture_output=True, text=True).stdout)
+        paginas = f', {m.group(1)} páginas' if m else ''
+    print(f'PDF: {out}{paginas}')
+
+
+# ----------------------------------------------------------------------------
+# pedidos, actualizar, previa
+# ----------------------------------------------------------------------------
+
+VACIOS = {'img', 'br', 'hr', 'meta', 'link', 'input', 'col', 'source', 'wbr', 'area', 'base', 'embed', 'track'}
+
+
+class LectorPedidos(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.slide = 0
+        self.titulo = ''
+        self.pila = []
+        self.capturas = []
+        self.pedidos = []
+        self.en_deck = False
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag == 'div' and d.get('id') == 'deck':
+            self.en_deck = True
+        if not self.en_deck:
+            return
+        clases = (d.get('class') or '').split()
+        if tag == 'section' and 'slide' in clases:
+            self.slide += 1
+            self.titulo = d.get('data-titulo', '')
+            if d.get('data-pedido'):
+                self.pedidos.append({'slide': self.slide, 'titulo': self.titulo, 'donde': 'toda la slide', 'pedido': d['data-pedido']})
+        elif d.get('data-pedido') is not None:
+            rec = {'slide': self.slide, 'titulo': self.titulo, 'pedido': d['data-pedido'], 'tag': tag,
+                   'clases': ' '.join(c for c in clases if c != 'el'), 'estilo': d.get('style', ''), 'src': d.get('src', ''), 'texto': ''}
+            self.pedidos.append(rec)
+            if tag not in VACIOS:
+                self.capturas.append((rec, len(self.pila)))
+        if tag not in VACIOS:
+            self.pila.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.en_deck or tag in VACIOS:
+            return
+        if self.pila:
+            self.pila.pop()
+        self.capturas = [(r, n) for r, n in self.capturas if n < len(self.pila)]
+
+    def handle_data(self, data):
+        for rec, _ in self.capturas:
+            rec['texto'] += data
+
+
+def cmd_pedidos(a) -> None:
+    deck = resolver_deck(a.archivo)
+    lp = LectorPedidos()
+    lp.feed(deck.read_text(encoding='utf-8', errors='replace'))
+    for p in lp.pedidos:
+        if 'texto' in p:
+            p['texto'] = re.sub(r'\s+', ' ', p['texto']).strip()
+            pos = re.search(r'left:\s*(-?[\d.]+)px;\s*top:\s*(-?[\d.]+)px', p.get('estilo', ''))
+            p['donde'] = (f'imagen {p["src"]}' if p['tag'] == 'img' else f'«{p["texto"][:80]}»' if p['texto'] else f'<{p["tag"]} class="{p["clases"]}">') + (f' en x {pos.group(1)}, y {pos.group(2)}' if pos else '')
+    if a.json:
+        print(json.dumps([{k: v for k, v in p.items() if k in ('slide', 'titulo', 'donde', 'pedido')} for p in lp.pedidos], ensure_ascii=False, indent=1))
+        return
+    if not lp.pedidos:
+        print('No hay pedidos.')
+        return
+    for p in lp.pedidos:
+        print(f'slide {p["slide"]} «{p["titulo"]}» · {p["donde"]}')
+        print(f'  pedido: {p["pedido"]}')
+    print(f'{len(lp.pedidos)} pedido(s). Al resolver uno, borrá su atributo data-pedido.')
+
+
+def cmd_actualizar(a) -> None:
+    deck = resolver_deck(a.archivo)
+    texto = deck.read_text(encoding='utf-8')
+    if not es_diapo(texto):
+        die('este archivo no tiene el formato de diapo (le faltan los bloques #motor-css y #motor); no lo toco.')
+    nuevo_css = MOTOR_CSS.read_text(encoding='utf-8').strip()
+    nuevo_js = MOTOR_JS.read_text(encoding='utf-8').strip()
+    t2 = re.sub(r'(<style id="motor-css">)(.*?)(</style>)', lambda m: f'{m.group(1)}\n{nuevo_css}\n{m.group(3)}', texto, count=1, flags=re.S)
+    t2 = re.sub(r'(<script id="motor">)(.*?)(</script>)', lambda m: f'{m.group(1)}\n{nuevo_js}\n{m.group(3)}', t2, count=1, flags=re.S)
+    t2 = re.sub(r'<meta name="generator" content="diapo [^"]*">', f'<meta name="generator" content="diapo {VERSION}">', t2, count=1)
+    if t2 == texto:
+        print(f'{deck.name} ya tenía el motor al día.')
+        return
+    respaldar(deck)
+    escribir(deck, t2)
+    print(f'Motor actualizado en {deck.name} (respaldo en .diapo/respaldos/).')
+
+
+def cmd_previa(a) -> None:
+    deck = resolver_deck(a.archivo)
+    texto = deck.read_text(encoding='utf-8')
+    t = re.sub(r'^\s*<!DOCTYPE html>\s*', '', texto, flags=re.I)
+    for pat in (r'<html[^>]*>\s*', r'</html>\s*', r'<head>\s*', r'</head>\s*', r'<body>\s*', r'</body>\s*',
+                r'<meta charset="[^"]*">\s*', r'<meta name="viewport"[^>]*>\s*'):
+        t = re.sub(pat, '', t, count=1, flags=re.I)
+    if a.titulo:
+        t = re.sub(r'<title>[^<]*</title>', f'<title>{esc(a.titulo)}</title>', t, count=1)
+    t = t.replace('<script id="motor">', '<script>window.DIAPO_VISTA_PREVIA = true;</script>\n<script id="motor">', 1)
+    dest = carpeta_oculta(deck.parent, 'previa') / deck.name
+    dest.write_text(t, encoding='utf-8')
+    refs = sorted(set(re.findall(r'''(?:src|href)="((?:img|fonts)/[^"#?]+)"''', texto)) | set(re.findall(r'url\(((?:img|fonts)/[^)]+)\)', texto)))
+    refs = [r for r in refs if (deck.parent / r).exists()]
+    print(json.dumps({'archivo': str(dest), 'raiz': str(deck.parent), 'archivos': refs}, ensure_ascii=False, indent=1))
+
+
+# ----------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog='diapo', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', metavar='COMANDO')
+
+    s = sub.add_parser('nuevo', help='crear una presentación a partir de un tema')
+    s.add_argument('carpeta', help='carpeta nueva (o ruta .html)')
+    s.add_argument('--tema', default='oscuro', help='oscuro (charlas) o claro (clases); ver: diapo temas')
+    s.add_argument('--titulo', help='título de la presentación')
+    s.set_defaults(fn=cmd_nuevo)
+
+    s = sub.add_parser('importar', help='convertir un .pptx o .pdf')
+    s.add_argument('archivo', help='.pptx (PowerPoint o Google Slides bajado como PowerPoint) o .pdf')
+    s.add_argument('--salida', help='carpeta de salida (por defecto, NOMBRE-diapo al lado del original)')
+    s.add_argument('--titulo', help='título de la presentación')
+    s.add_argument('--tema', default='claro', help='tema para las páginas de un PDF')
+    s.add_argument('--sin-fuentes', action='store_true', help='no bajar las tipografías de Google Fonts')
+    s.add_argument('--pisar', action='store_true', help='reemplazar una importación anterior (queda un respaldo)')
+    s.set_defaults(fn=cmd_importar)
+
+    s = sub.add_parser('ver', help='abrir con servidor local: guarda directo y recarga si Claude cambia el archivo')
+    s.add_argument('archivo', help='presentación .html (o su carpeta)')
+    s.add_argument('--puerto', type=int, default=8765)
+    s.add_argument('--no-abrir', action='store_true', help='no abrir el navegador')
+    s.add_argument('--editar', action='store_true', help='abrir directo en modo edición')
+    s.add_argument('--modelo', help='modelo para el chat (por ejemplo sonnet u opus); por defecto, el de tus ajustes de Claude Code')
+    s.set_defaults(fn=cmd_ver)
+
+    s = sub.add_parser('revisar', help='buscar problemas y sacar capturas de cada slide')
+    s.add_argument('archivo')
+    s.add_argument('--slides', help='cuáles, por ejemplo 3,5-7')
+    s.add_argument('--salida', help='carpeta para las capturas (por defecto .diapo/revision)')
+    s.add_argument('--sin-capturas', action='store_true')
+    s.add_argument('--json', action='store_true', help='salida para leer con un programa')
+    s.set_defaults(fn=cmd_revisar)
+
+    s = sub.add_parser('pdf', help='exportar a PDF, una slide por página')
+    s.add_argument('archivo')
+    s.add_argument('-o', '--salida', help='PDF de salida (por defecto, al lado del .html)')
+    s.set_defaults(fn=cmd_pdf)
+
+    s = sub.add_parser('pedidos', help='listar los pedidos a Claude')
+    s.add_argument('archivo')
+    s.add_argument('--json', action='store_true')
+    s.set_defaults(fn=cmd_pedidos)
+
+    s = sub.add_parser('actualizar', help='poner al día el motor de una presentación')
+    s.add_argument('archivo')
+    s.set_defaults(fn=cmd_actualizar)
+
+    s = sub.add_parser('previa', help='copia solo para mirar, lista para publicar como artifact')
+    s.add_argument('archivo')
+    s.add_argument('--titulo', help='otro título para la copia')
+    s.set_defaults(fn=cmd_previa)
+
+    s = sub.add_parser('temas', help='ver los temas disponibles')
+    s.set_defaults(fn=cmd_temas)
+
+    s = sub.add_parser('config', help='tu nombre y tu mail para la portada de las presentaciones nuevas')
+    s.add_argument('--nombre')
+    s.add_argument('--mail')
+    s.set_defaults(fn=cmd_config)
+
+    a = ap.parse_args()
+    if not getattr(a, 'fn', None):
+        ap.print_help()
+        return
+    a.fn(a)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,23 @@
+/* ===== ESTILOS · los marcados «estilo:» aparecen en el selector de la barra; los «fondo:», en el botón Fondo ===== */
+.slide{font-weight:400}
+.slide a{color:var(--link)}
+/* estilo: Título */ .titulo{font:700 48px/1.15 var(--f-titulo);color:var(--azul)}
+/* estilo: Título de portada */ .titulo-portada{font:700 54px/1.15 var(--f-titulo);color:var(--marino)}
+/* estilo: Subtítulo */ .subtitulo{font:400 30px/1.3 var(--f-titulo);color:var(--azul)}
+/* estilo: Cuerpo */ .cuerpo{font:400 30px/1.35 var(--f-cuerpo);color:var(--texto)}
+/* estilo: Viñetas */ .vinetas{font:400 30px/1.35 var(--f-cuerpo);color:var(--texto)}
+.vinetas p{position:relative;padding-left:1.1em}
+.vinetas p::before{content:'•';position:absolute;left:.15em;color:var(--azul)}
+/* estilo: Destacado */ .destacado{font:italic 400 30px/1.3 var(--f-cuerpo);color:var(--azul)}
+/* estilo: Chico */ .chico{font:400 20px/1.35 var(--f-cuerpo);color:var(--gris)}
+/* estilo: Cita */ .cita{font:italic 400 32px/1.35 var(--f-cuerpo);color:var(--texto)}
+/* estilo: Dato grande */ .dato{font:700 64px/1 var(--f-titulo);color:var(--azul)}
+/* estilo: [Fuente] */ .fuente,.fuentes a{font:700 22px/1.2 var(--f-link);color:var(--link);text-decoration:underline}
+/* estilo: Fila de fuentes */ .fuentes{font:700 22px/1.5 var(--f-link);color:var(--link)}
+.fuentes a{margin-right:.55em}
+/* estilo: Título de divisora */ .titulo-divisora{font:700 64px/1.15 var(--f-titulo);color:#fff;text-align:center}
+/* fondo: Divisora azul */ .slide.divisora{background:var(--divisora);color:#fff}
+/* fondo: Oscuro */ .slide.oscura{background:#16181d;color:#f3f4f6}
+.azul{color:var(--azul)}
+.rojo{color:var(--rojo)}
+.tabla th{font-weight:700;color:var(--azul)}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "diapo",
+  "description": "diapo: presentaciones HTML que se editan en el navegador y junto con Claude",
+  "owner": { "name": "Matías Bilkis", "url": "https://github.com/matibilkis" },
+  "plugins": [
+    {
+      "name": "diapo",
+      "description": "Presentaciones HTML de un solo archivo: se editan en el navegador como en Google Slides y Claude las edita como texto. Importa .pptx y .pdf, revisa las slides con capturas y trae un panel de chat dentro de la presentación.",
+      "author": { "name": "Matías Bilkis", "url": "https://github.com/matibilkis" },
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/matibilkis/diapo",
+      "keywords": ["slides", "presentaciones", "html", "pptx", "pdf"]
+    }
+  ]
+}

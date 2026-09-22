@@ -1,0 +1,18 @@
+/* ===== TEMA · colores y tipografías de toda la presentación (también con el botón «Tema») ===== */
+:root{
+  --fondo: #000000;       /* fondo de las slides */
+  --texto: #ffffff;       /* texto normal */
+  --amarillo: #ffff00;    /* títulos */
+  --verde: #c6ec87;       /* frases destacadas */
+  --verde-mano: #8cd872;  /* títulos a mano verdes */
+  --numero: #ff9900;      /* número de slide */
+  --link: #467886;        /* [fuentes] */
+  --violeta: #9900ff;     /* links de la portada */
+  --rojo: #ff0000;        /* pastilla de la portada */
+  --gris: #b8b8b8;        /* texto chico */
+  --numero-tam: 20px;
+  --f-titulo: 'Montserrat', 'Helvetica Neue', Arial, sans-serif;
+  --f-cuerpo: 'Montserrat', 'Helvetica Neue', Arial, sans-serif;
+  --f-mano: 'Amatic SC', 'Comic Sans MS', cursive;
+  --f-link: Arial, Helvetica, sans-serif;
+}

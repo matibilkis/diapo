@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Deja el comando `diapo` en el PATH y el skill a mano para Claude Code.
+# Uso: ./instalar            (enlaces en ~/.local/bin y ~/.claude/skills)
+#      ./instalar --sin-skill
+set -euo pipefail
+
+raiz="$(cd "$(dirname "$0")" && pwd)"
+bin="${DIAPO_BIN:-$HOME/.local/bin}"
+skills="$HOME/.claude/skills"
+con_skill=1
+[ "${1:-}" = "--sin-skill" ] && con_skill=0
+
+falta() { printf '  falta %s: %s\n' "$1" "$2"; }
+
+echo "diapo en $raiz"
+
+mkdir -p "$bin"
+if [ -e "$bin/diapo" ] && [ ! -L "$bin/diapo" ]; then
+  echo "  ya hay un archivo en $bin/diapo que no es un enlace; no lo toco." >&2
+  exit 1
+fi
+ln -sfn "$raiz/diapo" "$bin/diapo"
+echo "  comando: $bin/diapo"
+
+if [ "$con_skill" = 1 ]; then
+  mkdir -p "$skills"
+  if [ -e "$skills/diapo" ] && [ ! -L "$skills/diapo" ]; then
+    echo "  ya hay una carpeta en $skills/diapo; no la toco." >&2
+  else
+    ln -sfn "$raiz/skills/diapo" "$skills/diapo"
+    echo "  skill:   $skills/diapo"
+  fi
+fi
+
+echo "Qué encontré:"
+python3 - <<'PY'
+import importlib.util, shutil, sys
+v = sys.version_info
+print(f"  python {v.major}.{v.minor}" + ("" if v >= (3, 10) else "  (hace falta 3.10 o más nuevo)"))
+for mod, para in (('PIL', 'importar .pptx y .pdf, y las hojas de contacto'), ('playwright', 'revisar y exportar a PDF')):
+    print(f"  {'ok  ' if importlib.util.find_spec(mod) else 'falta'} {mod}: {para}")
+for cmd, para in (('pdftoppm', 'importar .pdf'), ('claude', 'el panel de chat')):
+    print(f"  {'ok  ' if shutil.which(cmd) else 'falta'} {cmd}: {para}")
+PY
+
+case ":$PATH:" in
+  *":$bin:"*) ;;
+  *) echo "Ojo: $bin no está en tu PATH. Agregalo en ~/.bashrc o ~/.zshrc:"; echo "  export PATH=\"$bin:\$PATH\"";;
+esac
+
+echo "Probá: diapo nuevo mi-charla --titulo \"Mi charla\" && diapo ver mi-charla"
