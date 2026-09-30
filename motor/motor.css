@@ -7,7 +7,8 @@ body{background:#000;color:#eee;font-family:system-ui,-apple-system,'Segoe UI',R
 .slide::after{content:attr(data-n);position:absolute;right:16px;bottom:8px;font:400 var(--numero-tam,20px)/1 var(--f-cuerpo,system-ui,sans-serif);color:var(--numero,#999);pointer-events:none}
 .slide.sin-numero::after{content:none}
 .slide aside.notas{display:none}
-.el{position:absolute;box-sizing:border-box;margin:0;line-height:1.25}
+.el{position:absolute;box-sizing:border-box;margin:0}
+:where(.el){line-height:1.25}
 img.el{display:block;height:auto}
 .el p{margin:0 0 .45em}
 .el p:last-child{margin-bottom:0}

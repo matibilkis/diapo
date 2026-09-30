@@ -943,6 +943,7 @@ async function detectServer() {
     if (!r.ok) return;
     const j = await r.json();
     SERVER = { archivo, hash: j.hash, chat: !!j.chat, modelo: j.modelo || '' };
+    if (Array.isArray(j.historial)) chatLog = j.historial;
     if (j.chat_ocupado) chatSetBusy(true);
   } catch (_) { return; }
   html.classList.add('con-servidor');
@@ -1015,8 +1016,8 @@ async function hotSwap() {
 /* chat con Claude: el servidor de `diapo ver` le pasa los pedidos a Claude Code sin ventana */
 const CHAT_KEY = KEY + ':chat';
 let chatOpen = false, chatWanted = false, chatBusy = false, chatT0 = 0, chatTimer = 0;
-let chatLog = (() => { try { return JSON.parse(store('get', CHAT_KEY) || '[]'); } catch (_) { return []; } })();
-function chatAdd(rol, texto, extra) { chatLog.push({ rol, texto, ...(extra || {}) }); if (chatLog.length > 300) chatLog = chatLog.slice(-300); store('set', CHAT_KEY, JSON.stringify(chatLog)); chatRender(); }
+let chatLog = [];
+function chatAdd(rol, texto, extra) { chatLog.push({ rol, texto, ...(extra || {}) }); if (chatLog.length > 300) chatLog = chatLog.slice(-300); chatRender(); }
 function chatFmt(t) { return esc(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>'); }
 function buildChat() {
   const p = mk('div', { id: 'chat-panel', 'data-ui': '' }, `
@@ -1094,9 +1095,10 @@ async function chatSend(texto) {
   if (editing) endEdit();
   if (dirty) { await save(); if (dirty) { chatAdd('error', 'Antes de mandar el pedido hay que guardar tus cambios, y no se guardaron. Guardá con Ctrl+S y volvé a mandarlo.'); return false; } }
   const els = cur() ? $$(':scope > .el', cur()) : [];
-  chatAdd('yo', texto, { ctx: chatCtxText() });
+  const ctx = chatCtxText();
+  chatAdd('yo', texto, { ctx });
   chatSetBusy(true);
-  const ok = await chatPost('', { texto, slide: idx + 1, elemento: sel && els.includes(sel) ? els.indexOf(sel) : null });
+  const ok = await chatPost('', { texto, ctx, slide: idx + 1, elemento: sel && els.includes(sel) ? els.indexOf(sel) : null });
   if (!ok) chatSetBusy(false);
   return ok;
 }
@@ -1110,7 +1112,7 @@ function chatEvent(d) {
     case 'fin': chatSetBusy(false); if (d.ok) chatAdd('meta', `${d.segundos} s`); else chatAdd('error', d.texto || 'Claude no terminó bien.'); break;
     case 'error': chatSetBusy(false); chatAdd('error', d.texto); break;
     case 'parado': chatSetBusy(false); chatAdd('info', 'Lo paré. El próximo mensaje sigue la misma conversación.'); break;
-    case 'nueva': chatSetBusy(false); chatLog = []; store('del', CHAT_KEY); chatRender(); break;
+    case 'nueva': chatSetBusy(false); chatLog = []; chatRender(); break;
   }
 }
 

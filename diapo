@@ -79,10 +79,13 @@ def carpeta_oculta(carpeta: Path, sub: str = '') -> Path:
     return base
 
 
-def respaldar(archivo: Path, guardar: int = 30) -> None:
+def respaldar(archivo: Path, guardar: int = 50, cada: int = 60) -> None:
     if not archivo.exists():
         return
     dest = carpeta_oculta(archivo.parent, 'respaldos')
+    ultimo = max(dest.glob(f'{archivo.stem}.*{archivo.suffix}'), key=lambda v: v.stat().st_mtime, default=None)
+    if cada and ultimo and time.time() - ultimo.stat().st_mtime < cada:
+        return
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     shutil.copy2(archivo, dest / f'{archivo.stem}.{stamp}{archivo.suffix}')
     viejos = sorted(dest.glob(f'{archivo.stem}.*{archivo.suffix}'))
@@ -393,6 +396,51 @@ class Contexto:
         self.txstyles = self.tree.find(f'{P}txStyles')
 
 
+IMG_LADO_MAX = 1920
+
+
+def achicar_imagen(data: bytes, ext: str) -> tuple[bytes, str]:
+    """Pasa a WebP y limita el lado mayor; se queda con el original si no gana."""
+    if ext == '.gif':
+        return achicar_gif(data)
+    if ext not in ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'):
+        return data, ext
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        im.load()
+    except Exception:
+        return data, ext
+    if max(im.size) > IMG_LADO_MAX:
+        im.thumbnail((IMG_LADO_MAX, IMG_LADO_MAX), Image.LANCZOS)
+    alfa = im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info)
+    im = im.convert('RGBA' if alfa else 'RGB')
+    buf = io.BytesIO()
+    im.save(buf, 'WEBP', quality=85, method=2)
+    nuevo = buf.getvalue()
+    return (nuevo, '.webp') if len(nuevo) < len(data) else (data, ext)
+
+
+def achicar_gif(data: bytes, lado: int = 1280) -> tuple[bytes, str]:
+    try:
+        from PIL import Image, ImageSequence
+        im = Image.open(io.BytesIO(data))
+        cuadros, tiempos = [], []
+        for c in ImageSequence.Iterator(im):
+            tiempos.append(c.info.get('duration') or im.info.get('duration') or 100)
+            c = c.convert('RGBA')
+            if max(c.size) > lado:
+                c.thumbnail((lado, lado), Image.LANCZOS)
+            cuadros.append(c)
+        buf = io.BytesIO()
+        cuadros[0].save(buf, 'WEBP', save_all=True, append_images=cuadros[1:], duration=tiempos,
+                        loop=im.info.get('loop', 0), quality=75, method=2)
+        nuevo = buf.getvalue()
+    except Exception:
+        return data, '.gif'
+    return (nuevo, '.webp') if len(nuevo) < len(data) else (data, '.gif')
+
+
 class Pptx:
     def __init__(self, path: Path, carpeta: Path, ancho: int = 1280):
         self.z = zipfile.ZipFile(path)
@@ -417,6 +465,8 @@ class Pptx:
         self.stats = Counter()
         self.familias: dict = {}
         self.numero = None
+        self.slide_n = 0
+        self.bytes_orig = self.bytes_final = 0
 
     # --- partes del zip
     def xml(self, part: str):
@@ -961,12 +1011,18 @@ class Pptx:
                 im.convert('RGB').save(buf, 'JPEG', quality=90)
             data = buf.getvalue()
             stem += '-recorte' if recortar else ''
-        nombre = f'{stem}{ext}'
-        i = 2
+        self.bytes_orig += len(data)
+        data, ext = achicar_imagen(data, ext)
+        if ext == '.gif' or (ext == '.webp' and b'ANIM' in data[:64]):
+            self.stats['animaciones (en el PDF quedan quietas)'] += 1
+        stem = f's{self.slide_n:02d}' if self.slide_n else 'fondo'
+        i = 1
+        nombre = f'{stem}-{i}{ext}'
         while nombre in self.usados:
-            nombre = f'{stem}-{i}{ext}'
             i += 1
+            nombre = f'{stem}-{i}{ext}'
         self.usados.add(nombre)
+        self.bytes_final += len(data)
         self.img_dir.mkdir(parents=True, exist_ok=True)
         (self.img_dir / nombre).write_bytes(data)
         self.cache[key] = f'img/{nombre}'
@@ -1262,6 +1318,7 @@ class Pptx:
         return arriba[1] or f'Slide {n}'
 
     def slide(self, part: str, n: int) -> str:
+        self.slide_n = n
         tree = self.xml(part)
         lay_part = self.rel_de_tipo(part, '/slideLayout')
         lay = self.xml(lay_part) if lay_part and lay_part in self.names else None
@@ -1354,6 +1411,7 @@ def importar_pptx(src: Path, carpeta: Path, titulo: str, sin_fuentes: bool) -> t
     html_ = armar(titulo, secciones, archivo=f'{carpeta.name}.html', ancho=imp.W, alto=imp.H,
                   fuentes_css=fuentes_css, tema_css=tema, estilos_css=estilos_importados(), google=google)
     info = {'slides': len(imp.slides), 'lienzo': f'{imp.W}×{imp.H}', 'detalle': dict(imp.stats),
+            'peso': f'{imp.bytes_orig / 1e6:.1f} MB en el pptx → {imp.bytes_final / 1e6:.1f} MB en img/' if imp.bytes_orig else '',
             'fuentes locales': sorted(f for f in imp.familias if f.lower() not in SISTEMA and f not in faltan) if not sin_fuentes else [],
             'fuentes sin bajar': faltan}
     return html_, info
@@ -1362,9 +1420,13 @@ def importar_pptx(src: Path, carpeta: Path, titulo: str, sin_fuentes: bool) -> t
 def importar_pdf(src: Path, carpeta: Path, titulo: str, tema: str) -> tuple[str, dict]:
     if not shutil.which('pdftoppm'):
         die('para importar PDF hace falta pdftoppm (paquete poppler-utils).')
+    if not shutil.which('pdfinfo'):
+        die('para importar PDF hace falta pdfinfo (paquete poppler-utils).')
     out = subprocess.run(['pdfinfo', str(src)], capture_output=True, text=True).stdout
-    paginas = int(re.search(r'Pages:\s+(\d+)', out).group(1))
-    m = re.search(r'Page size:\s+([\d.]+) x ([\d.]+)', out)
+    pags, m = re.search(r'Pages:\s+(\d+)', out), re.search(r'Page size:\s+([\d.]+) x ([\d.]+)', out)
+    if not pags or not m:
+        die(f'pdfinfo no pudo leer {src.name}; ¿está dañado o protegido?')
+    paginas = int(pags.group(1))
     wpt, hpt = float(m.group(1)), float(m.group(2))
     W = 1280
     H = round(W * hpt / wpt)
@@ -1415,13 +1477,15 @@ def cmd_importar(a) -> None:
         html_, info = importar_pdf(src, carpeta, titulo, a.tema)
     html_ = html_.replace(f'diapo ver {carpeta.name}.html', f'diapo ver {archivo.name}')
     if archivo.exists():
-        respaldar(archivo)
+        respaldar(archivo, cada=0)
     escribir(archivo, html_)
     carpeta_oculta(carpeta)
     print(f'Importada: {archivo}')
     print(f'  {info["slides"]} slides, lienzo {info["lienzo"]}')
     for k, v in sorted(info.get('detalle', {}).items()):
         print(f'  {k}: {v}')
+    if info.get('peso'):
+        print(f'  imágenes: {info["peso"]}')
     if info.get('fuentes locales'):
         print(f'  tipografías guardadas en fonts/: {", ".join(info["fuentes locales"])}')
     if info.get('fuentes sin bajar'):
@@ -1496,7 +1560,7 @@ def reglas_chat(deck: Path) -> str:
     estilos = ', '.join(f'{n} (.{c})' for n, c in re.findall(r'/\*\s*estilo:\s*([^*]+?)\s*\*/\s*\.([\w-]+)', est)) or 'ninguno'
     fondos = ', '.join(f'{n} (.slide.{c})' for n, c in re.findall(r'/\*\s*fondo:\s*([^*]+?)\s*\*/\s*\.slide\.([\w-]+)', est)) or 'ninguno'
     colores = ', '.join(f'var(--{n}) {v}' for n, v in re.findall(r'--([\w-]+)\s*:\s*(#[0-9a-fA-F]{3,8})\s*;', tem)) or 'ninguno'
-    return f"""Estás en el panel de chat de diapo, al costado de la presentación que la persona edita en el navegador. Trabajás sobre un solo archivo: {deck.name}, en la carpeta actual. Cada vez que lo guardás, la página se actualiza sola: Matías ve el cambio enseguida y lo puede deshacer con Ctrl+Z.
+    return f"""Estás en el panel de chat de diapo, al costado de la presentación que la persona edita en el navegador. Trabajás sobre un solo archivo: {deck.name}, en la carpeta actual. Cada vez que lo guardás, la página se actualiza sola: {config().get('nombre') or 'la persona'} ve el cambio enseguida y lo puede deshacer con Ctrl+Z.
 
 Cada mensaje empieza con un contexto entre corchetes: en qué slide está (número, título y líneas del archivo) y qué elemento tiene elegido. «Esto», «acá» o «esta slide» se refieren a eso.
 
@@ -1569,6 +1633,7 @@ class Chat:
         self.t0 = 0.0
         self.error = ''
         self.modelo_real = None
+        self.reglas = ''
         self.oyentes: list[queue.Queue] = []
         self.candado = threading.Lock()
         self.estado = carpeta_oculta(deck.parent) / 'chat.json'
@@ -1576,6 +1641,18 @@ class Chat:
             self.sesion = json.loads(self.estado.read_text(encoding='utf-8')).get(deck.name)
         except (OSError, ValueError):
             self.sesion = None
+        self.archivo_historial = carpeta_oculta(deck.parent) / f'chat-{deck.stem}.json'
+        try:
+            self.historial = json.loads(self.archivo_historial.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            self.historial = []
+
+    def anotar(self, rol: str, texto: str, **extra) -> None:
+        self.historial = (self.historial + [{'rol': rol, 'texto': texto, **extra}])[-300:]
+        try:
+            self.archivo_historial.write_text(json.dumps(self.historial, ensure_ascii=False), encoding='utf-8')
+        except OSError:
+            pass
 
     def guardar_sesion(self) -> None:
         try:
@@ -1589,14 +1666,27 @@ class Chat:
         self.estado.write_text(json.dumps(d), encoding='utf-8')
 
     def emitir(self, ev: dict) -> None:
+        t = ev.get('tipo')
+        if t in ('paso', 'info', 'error'):
+            self.anotar(t, ev['texto'])
+        elif t == 'texto':
+            self.anotar('claude', ev['texto'])
+        elif t == 'fin':
+            self.anotar('meta', f'{ev["segundos"]} s') if ev.get('ok') else self.anotar('error', ev.get('texto') or 'Claude no terminó bien.')
+        elif t == 'parado':
+            self.anotar('info', 'Lo paré. El próximo mensaje sigue la misma conversación.')
+        elif t == 'nueva':
+            self.historial = []
+            self.archivo_historial.unlink(missing_ok=True)
         for q in list(self.oyentes):
             q.put(ev)
 
     def arrancar(self) -> None:
+        self.reglas = reglas_chat(self.deck)
         cmd = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
                '--safe-mode', '--permission-mode', 'default',
                '--allowedTools', f'Edit(./{self.deck.name})', 'Bash(diapo revisar:*)', 'Bash(diapo pedidos:*)',
-               '--append-system-prompt', reglas_chat(self.deck)]
+               '--append-system-prompt', self.reglas]
         if self.modelo:
             cmd += ['--model', self.modelo]
         self.retoma = bool(self.sesion)
@@ -1672,15 +1762,19 @@ class Chat:
         self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + '\n')
         self.proc.stdin.flush()
 
-    def enviar(self, texto: str, slide, elemento) -> tuple[int, dict]:
+    def enviar(self, texto: str, slide, elemento, ctx: str = '') -> tuple[int, dict]:
         if not shutil.which('claude'):
             return 503, {'error': 'No encuentro el comando claude.'}
         with self.candado:
             if self.ocupado:
                 return 409, {'error': 'Claude todavía está trabajando en el pedido anterior.'}
-            respaldar(self.deck)
+            respaldar(self.deck, cada=0)
             msg = contexto_chat(self.deck, slide, elemento) + '\n\n' + texto
+            if self.proc is not None and self.reglas != reglas_chat(self.deck):
+                viejo, self.proc = self.proc, None
+                viejo.terminate()
             self.ocupado, self.pendiente, self.t0 = True, msg, time.time()
+            self.anotar('yo', texto, ctx=str(ctx)[:200])
             for _ in range(2):
                 if self.proc is None or self.proc.poll() is not None:
                     self.arrancar()
@@ -1779,7 +1873,8 @@ class Servidor(SimpleHTTPRequestHandler):
                 return self.json(404, {'error': 'archivo'})
             c = self.chat(p)
             return self.json(200, {'hash': huella(p), 'version': VERSION, 'chat': bool(shutil.which('claude')),
-                                   'chat_ocupado': c.ocupado, 'modelo': c.modelo_real or Servidor.modelo or ''})
+                                   'chat_ocupado': c.ocupado, 'modelo': c.modelo_real or Servidor.modelo or '',
+                                   'historial': c.historial})
         if u.path == '/__diapo/eventos':
             p = self.archivo(parse_qs(u.query))
             if not p:
@@ -1856,7 +1951,7 @@ class Servidor(SimpleHTTPRequestHandler):
             texto = str(d.get('texto') or '').strip()
             if not texto:
                 return self.json(400, {'error': 'el mensaje está vacío'})
-            return self.json(*self.chat(p).enviar(texto, d.get('slide'), d.get('elemento')))
+            return self.json(*self.chat(p).enviar(texto, d.get('slide'), d.get('elemento'), d.get('ctx') or ''))
         if u.path == '/__diapo/chat/parar':
             self.cuerpo()
             self.chat(p).parar()
@@ -2184,7 +2279,7 @@ def cmd_actualizar(a) -> None:
     if t2 == texto:
         print(f'{deck.name} ya tenía el motor al día.')
         return
-    respaldar(deck)
+    respaldar(deck, cada=0)
     escribir(deck, t2)
     print(f'Motor actualizado en {deck.name} (respaldo en .diapo/respaldos/).')
 
