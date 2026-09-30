@@ -39,7 +39,7 @@ v = sys.version_info
 print(f"  python {v.major}.{v.minor}" + ("" if v >= (3, 10) else "  (hace falta 3.10 o más nuevo)"))
 for mod, para in (('PIL', 'importar .pptx y .pdf, y las hojas de contacto'), ('playwright', 'revisar y exportar a PDF')):
     print(f"  {'ok  ' if importlib.util.find_spec(mod) else 'falta'} {mod}: {para}")
-for cmd, para in (('pdftoppm', 'importar .pdf'), ('claude', 'el panel de chat')):
+for cmd, para in (('pdftoppm', 'importar .pdf'), ('claude', 'el panel de chat'), ('uv', 'diapo qr')):
     print(f"  {'ok  ' if shutil.which(cmd) else 'falta'} {cmd}: {para}")
 PY
 

@@ -23,6 +23,7 @@ Hace falta Python 3.10 o más nuevo. Lo demás es opcional y el instalador te di
 | `revisar` y `pdf` | `pip install playwright && playwright install chromium` |
 | Importar `.pdf` | `poppler-utils` (`pdftoppm`, `pdftotext`) |
 | El panel de chat | [Claude Code](https://claude.com/claude-code) instalado y con sesión iniciada |
+| `diapo qr` | [uv](https://docs.astral.sh/uv/) (baja `segno` la primera vez) |
 
 ### Como plugin de Claude Code
 
