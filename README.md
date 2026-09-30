@@ -61,7 +61,7 @@ diapo config --nombre "Tu nombre" --mail "vos@correo"      # lo que va en la por
 `diapo ver` abre la presentación con un servidor local. **E** entra al modo edición, **Ctrl+S** guarda en el archivo de verdad, **?** muestra toda la ayuda.
 
 - Arrastrar mueve, con imán cada 10 px. La esquina cambia el tamaño. Doble clic escribe.
-- Pegar una captura con Ctrl+V la mete en la slide; si tenías un recuadro punteado elegido, la pone ahí.
+- Pegar una captura con Ctrl+V (o arrastrar un archivo) la mete en la slide; si tenías un recuadro punteado o una imagen elegida, la pone ahí. Con `diapo ver` la imagen se guarda en `img/` y el HTML queda liviano.
 - **Tema** cambia colores y tipografías de toda la presentación. **Fondo** cambia el fondo de una slide.
 - **O** es la vista general, con las miniaturas, y se arrastran para cambiar el orden. **P** abre la ventana del presentador, con las notas y el reloj.
 - Funciona sin internet: las tipografías quedan en la carpeta `fonts/` de cada presentación.

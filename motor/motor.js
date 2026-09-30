@@ -663,6 +663,17 @@ function pasteElement(h) {
 }
 
 /* imágenes */
+async function imagenSrc(f) {
+  if (SERVER) {
+    try {
+      const r = await fetch('/__diapo/imagen?archivo=' + encodeURIComponent(SERVER.archivo) + '&nombre=' + encodeURIComponent(f.name || ''), { method: 'POST', headers: { 'Content-Type': f.type || 'application/octet-stream' }, body: f });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.src) return j.src;
+      if (j.error) throw new Error(j.error);
+    } catch (err) { if (err.message && !/fetch/i.test(err.message)) throw err; }
+  }
+  return fileToURL(f);
+}
 function fileToURL(f) {
   return new Promise((res, rej) => {
     if (/gif|svg/.test(f.type)) { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); return; }
@@ -682,7 +693,7 @@ function fileToURL(f) {
 }
 function pickFile(cb) {
   const i = mk('input', { type: 'file', accept: 'image/*' });
-  i.addEventListener('change', async () => { const f = i.files && i.files[0]; if (f) { try { cb(await fileToURL(f)); } catch (err) { toast(err.message); } } });
+  i.addEventListener('change', async () => { const f = i.files && i.files[0]; if (f) { try { cb(await imagenSrc(f)); } catch (err) { toast(err.message); } } });
   i.click();
 }
 function pickImage(el) {
@@ -742,7 +753,7 @@ doc.addEventListener('paste', async e => {
   if (item) {
     e.preventDefault();
     const target = !editing && sel && !isText(sel) ? sel : null;
-    try { const url = await fileToURL(item.getAsFile()); if (target) replaceImage(target, url); else placeImage(url); } catch (err) { toast(err.message); }
+    try { const url = await imagenSrc(item.getAsFile()); if (target) replaceImage(target, url); else placeImage(url); } catch (err) { toast(err.message); }
     return;
   }
   const txt = cd.getData('text/plain');
@@ -770,7 +781,7 @@ addEventListener('drop', async e => {
   e.preventDefault();
   if (!editMode) { toast('Para agregar imágenes, entrá al modo edición (E).'); return; }
   const f = [...e.dataTransfer.files].find(x => x.type.startsWith('image/')); if (!f) return;
-  let url; try { url = await fileToURL(f); } catch (err) { toast(err.message); return; }
+  let url; try { url = await imagenSrc(f); } catch (err) { toast(err.message); return; }
   const tgt = e.target.closest && e.target.closest('.el');
   if (tgt && cur().contains(tgt) && !isText(tgt)) { replaceImage(tgt, url); return; }
   const r = deck.getBoundingClientRect();

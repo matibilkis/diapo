@@ -1992,6 +1992,20 @@ class Servidor(SimpleHTTPRequestHandler):
         p = self.archivo(q)
         if not p:
             return self.json(403, {'error': 'archivo'})
+        if u.path == '/__diapo/imagen':
+            largo = int(self.headers.get('Content-Length') or 0)
+            if not 0 < largo <= 60_000_000:
+                return self.json(413, {'error': 'La imagen está vacía o pesa más de 60 MB.'})
+            data = self.cuerpo()
+            nombre = Path((q.get('nombre') or [''])[0]).name
+            ext = ext_de(data, nombre)
+            if ext not in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.tif', '.tiff'):
+                return self.json(415, {'error': 'Eso no parece una imagen.'})
+            data, ext = achicar_imagen(data, ext)
+            stem = Path(nombre).stem if nombre and Path(nombre).stem.lower() not in ('image', 'imagen', 'clipboard', 'blob') else ''
+            src = guardar_imagen(p.parent, stem or f'pegada-{datetime.now():%Y%m%d-%H%M%S}', ext, data)
+            print(f'  {datetime.now():%H:%M:%S} imagen guardada en {src}')
+            return self.json(200, {'src': src})
         if u.path == '/__diapo/guardar':
             cuerpo = self.cuerpo()
             base = (q.get('base') or [''])[0]
