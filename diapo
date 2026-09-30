@@ -4,6 +4,8 @@
 Comandos:
   nuevo       crea una presentación a partir de un tema (o de un guion en markdown)
   agregar     suma slides escritas en un guion markdown
+  imagen      trae una imagen (archivo o URL) y la pone en un recuadro
+  qr          arma el QR de un link y lo pone en un recuadro
   importar    convierte un .pptx (PowerPoint o Google Slides) o un .pdf
   ver         la abre con un servidor local: guarda directo y se recarga sola si Claude cambia el archivo
   revisar     la renderiza sin ventana, busca problemas y saca capturas para mirar
@@ -253,17 +255,18 @@ def cmd_nuevo(a) -> None:
 
 def cmd_config(a) -> None:
     c = config()
-    for k in ('nombre', 'mail'):
+    for k in ('nombre', 'mail', 'modelo_chat'):
         v = getattr(a, k, None)
         if v is not None:
             c[k] = v
-    if any(getattr(a, k, None) is not None for k in ('nombre', 'mail')):
+    if any(getattr(a, k, None) is not None for k in ('nombre', 'mail', 'modelo_chat')):
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(c, ensure_ascii=False, indent=1), encoding='utf-8')
     print(f'{CONFIG}:')
     print(f'  nombre: {c.get("nombre") or "(sin poner)"}')
     print(f'  mail:   {c.get("mail") or "(sin poner)"}')
-    print('Se usan en la portada de las presentaciones nuevas.')
+    print(f'  modelo del chat: {c.get("modelo_chat") or "opus (por defecto)"}')
+    print('Nombre y mail van en la portada de las presentaciones nuevas; el modelo, en el chat de diapo ver.')
 
 
 def cmd_temas(a) -> None:
@@ -1572,9 +1575,11 @@ class Estructura(HTMLParser):
 
 def contexto_chat(deck: Path, slide, elemento) -> str:
     """Lo que Claude necesita saber para entender «esto» o «esta slide»."""
+    texto = deck.read_text(encoding='utf-8', errors='replace')
     e = Estructura()
-    e.feed(deck.read_text(encoding='utf-8', errors='replace'))
+    e.feed(texto)
     partes = [f'{deck.name} tiene {len(e.slides)} slides.']
+    html_slide = ''
     if isinstance(slide, int) and 1 <= slide <= len(e.slides):
         s = e.slides[slide - 1]
         partes.append(f'Está mirando la slide {slide}, «{s["titulo"]}», líneas {s["ini"]} a {s["fin"]}.')
@@ -1583,7 +1588,10 @@ def contexto_chat(deck: Path, slide, elemento) -> str:
             partes.append(f'Tiene elegido el elemento de la línea {el["linea"]} (<{el["tag"]} class="{("el " + el["clases"]).strip()}">).')
         else:
             partes.append('No tiene ningún elemento elegido.')
-    return '[Panel de diapo: ' + ' '.join(partes) + ']'
+        crudo = '\n'.join(texto.split('\n')[s['ini'] - 1:s['fin']])
+        crudo = re.sub(r'(src|href)="data:[^"]{40,}"', r'\1="data:…"', crudo)
+        html_slide = crudo if len(crudo) <= 4000 else crudo[:4000] + '\n… (sigue; leé el resto con Read)'
+    return '[Panel de diapo: ' + ' '.join(partes) + ']' + (f'\n[HTML de la slide actual]\n{html_slide}' if html_slide else '')
 
 
 def reglas_chat(deck: Path) -> str:
@@ -1610,12 +1618,15 @@ Formato del archivo:
 - No toques <style id="motor-css">, <script id="motor"> ni <style id="fuentes">.
 
 Cómo trabajar:
-- Leé con Read solo las líneas que necesitás (offset y limit) y editá con Edit, con cambios mínimos. No reescribas el archivo.
-- Para una slide nueva, copiá la estructura de una parecida de la misma presentación.
-- Si cambian tamaños, posiciones o textos largos, verificá con `diapo revisar {deck.name} --slides N` y mirá la captura .diapo/revision/slide-NN.png con Read. Para un cambio chico de texto no hace falta.
+- Cambios puntuales: leé con Read solo las líneas que necesitás (offset y limit) y editá con Edit, con cambios mínimos. No reescribas el archivo. El HTML de la slide actual ya viene en el contexto del mensaje.
+- Varias slides nuevas (una clase, una sección): escribí un guion en .diapo/guion.md y corré `diapo agregar {deck.name} --desde .diapo/guion.md --despues N`. Guion: bloques separados por una línea ---; «# Título», párrafos, viñetas con «- », «![descripción](URL o ruta)», «[imagen: qué va]» para un recuadro, «$$ … $$» para una ecuación, «> cita» y «— autor», una línea «|||» para dos columnas, «Fuentes: [Autor año](URL)» y «Notas: …» al final del bloque. diapo calcula las posiciones; no escribas coordenadas para contenido nuevo. Si el pedido es grande, primero mandá el esquema (títulos de las slides) en una línea por slide y armá después.
+- Datos, cifras, fechas y citas: verificalos con WebSearch o WebFetch antes de ponerlos, y dejá la fuente en «Fuentes:» o en las notas. Si no pudiste verificar algo, decilo en las notas.
+- Imágenes: buscá una con licencia libre (Wikimedia Commons u otra fuente abierta) y ponela con `diapo imagen {deck.name} URL --hueco N[:K]`, que la baja, la achica y la ajusta al recuadro K de la slide N. Anotá el origen y la licencia en las notas. Si no encontrás una buena, dejá el recuadro con una descripción clara. Para un link en QR: `diapo qr {deck.name} URL --hueco N[:K]`.
+- Verificá con `diapo revisar {deck.name} --slides N-M` y mirá las capturas .diapo/revision/slide-NN.png con Read cuando agregues slides o cambies tamaños, posiciones o textos largos. Para un cambio chico de texto no hace falta.
 - Los pedidos que dejó con el botón Pedido se ven con `diapo pedidos {deck.name}`. Al resolver uno, borrá su atributo data-pedido.
-- Podés leer otros archivos si te los nombra, pero solo podés modificar esta presentación. No podés bajar imágenes: si falta una, dejá un hueco que diga qué va.
-- Contenido: seguí el tono del resto de la presentación, frases cortas, sin aforismos. Los datos van con su fuente, en las notas o en un [link].
+- Solo podés modificar esta presentación, su carpeta img/ y .diapo/. Podés leer otros archivos si te los nombra.
+- Contenido: seguí el tono del resto de la presentación, frases cortas, sin aforismos.
+- Mientras trabajás en algo largo, antes de cada etapa escribí una línea corta con lo que vas a hacer: la persona la ve en el panel.
 
 Respondé en español, en una o dos líneas: qué cambiaste y en qué slide. Si algo no se pudo, decilo."""
 
@@ -1635,7 +1646,9 @@ def paso_chat(nombre: str, entrada: dict, deck: Path) -> str:
     if nombre in ('Edit', 'MultiEdit'):
         return 'Edita la presentación' if base == deck.name else f'Quiere editar {base}'
     if nombre == 'Write':
-        return f'Quiere escribir {base}'
+        if base == 'guion.md':
+            return 'Escribe el guion de las slides nuevas'
+        return f'Escribe {base}' if '/img/' in f or '/.diapo/' in f else f'Quiere escribir {base}'
     if nombre == 'Bash':
         c = str(entrada.get('command') or '').strip()
         if c.startswith('diapo revisar'):
@@ -1643,9 +1656,20 @@ def paso_chat(nombre: str, entrada: dict, deck: Path) -> str:
             return 'Revisa cómo quedó' + (f' la slide {m.group(1)}' if m else '')
         if c.startswith('diapo pedidos'):
             return 'Lee los pedidos'
+        if c.startswith('diapo agregar'):
+            return 'Arma las slides nuevas desde el guion'
+        if c.startswith('diapo imagen'):
+            m = re.search(r'--hueco\s+(\d+)', c)
+            return 'Pone una imagen' + (f' en la slide {m.group(1)}' if m else '')
+        if c.startswith('diapo qr'):
+            return 'Arma un QR'
+        if c.startswith('diapo pdf'):
+            return 'Exporta el PDF'
         if re.match(r'(grep|rg|sed -n|head|tail|cat|wc|ls)\b', c):
             return 'Busca en el archivo'
         return f'Quiere correr: {c[:60]}'
+    if nombre == 'ToolSearch':
+        return 'Prepara sus herramientas'
     if nombre in ('Grep', 'Glob'):
         return 'Busca en el archivo'
     if nombre == 'WebSearch':
@@ -1722,7 +1746,9 @@ class Chat:
         self.reglas = reglas_chat(self.deck)
         cmd = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
                '--safe-mode', '--permission-mode', 'default',
-               '--allowedTools', f'Edit(./{self.deck.name})', 'Bash(diapo revisar:*)', 'Bash(diapo pedidos:*)',
+               '--allowedTools', f'Edit(./{self.deck.name})', 'Edit(./img/**)', 'Edit(./.diapo/**)',
+               'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+               *(f'Bash(diapo {c}:*)' for c in ('revisar', 'pedidos', 'agregar', 'imagen', 'qr', 'pdf')),
                '--append-system-prompt', self.reglas]
         if self.modelo:
             cmd += ['--model', self.modelo]
@@ -2004,7 +2030,7 @@ def cmd_ver(a) -> None:
     deck = resolver_deck(a.archivo)
     copiar_katex(deck.parent)
     Servidor.raiz = deck.parent.resolve()
-    Servidor.modelo = getattr(a, 'modelo', None)
+    Servidor.modelo = getattr(a, 'modelo', None) or config().get('modelo_chat') or 'opus'
     handler = lambda *args, **kw: Servidor(*args, directory=str(Servidor.raiz), **kw)
     srv = None
     for puerto in range(a.puerto, a.puerto + 30):
@@ -2053,7 +2079,7 @@ CHEQUEO_JS = r"""
     const out = [], tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
     let t;
     while ((t = tw.nextNode())) {
-      if (!t.nodeValue.trim()) continue;
+      if (!t.nodeValue.trim() || t.parentNode.closest('.katex-mathml')) continue;
       const r = document.createRange(); r.selectNodeContents(t);
       for (const x of r.getClientRects()) if (x.width > 1 && x.height > 1) out.push({l: (x.left - deckR.left) / k, t: (x.top - deckR.top) / k, r: (x.right - deckR.left) / k, b: (x.bottom - deckR.top) / k});
     }
@@ -2338,12 +2364,14 @@ class Maquetador:
                 p = Path(ruta).expanduser()
                 p = p if p.is_absolute() else (self.base / p)
                 data, nombre = p.read_bytes(), p.name
-            ext = Path(nombre).suffix.lower() or '.png'
-            data, ext = achicar_imagen(data, ext)
-            from PIL import Image
-            tam = Image.open(io.BytesIO(data)).size
+            data, ext = achicar_imagen(data, ext_de(data, nombre))
+            if ext == '.svg':
+                tam = tam_svg(data)
+            else:
+                from PIL import Image
+                tam = Image.open(io.BytesIO(data)).size
         except Exception as e:
-            self.avisos.append(f'no pude usar la imagen {ruta} ({type(e).__name__}); quedó un recuadro')
+            self.avisos.append(f'no pude usar la imagen {ruta} ({type(e).__name__}: {str(e)[:80]}); quedó un recuadro')
             return None, (0, 0)
         return guardar_imagen(self.carpeta, Path(nombre).stem, ext, data), tam
 
@@ -2476,6 +2504,128 @@ def cmd_agregar(a) -> None:
     for av in avisos:
         print(f'  ojo: {av}')
     print(f'Revisalas con: diapo revisar {deck.name} --slides {n + 1}-{n + len(secciones)}')
+
+
+# ----------------------------------------------------------------------------
+# imagen y qr: traer algo a img/ y ponerlo en un recuadro
+# ----------------------------------------------------------------------------
+
+HUECO_RE = re.compile(r'<div class="el hueco([^"]*)" style="([^"]*)"([^>]*)>(.*?)</div>', re.S)
+
+
+def ext_de(data: bytes, nombre: str) -> str:
+    ext = Path(nombre).suffix.lower()
+    if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.tif', '.tiff'):
+        return ext
+    cabeza = data[:512]
+    if cabeza.startswith(b'\x89PNG'):
+        return '.png'
+    if cabeza.startswith(b'\xff\xd8'):
+        return '.jpg'
+    if cabeza.startswith(b'GIF8'):
+        return '.gif'
+    if cabeza[:4] == b'RIFF' and cabeza[8:12] == b'WEBP':
+        return '.webp'
+    if b'<svg' in cabeza:
+        return '.svg'
+    return ext or '.png'
+
+
+def tam_svg(data: bytes) -> tuple[int, int]:
+    t = data[:4000].decode('utf-8', 'replace')
+    m = re.search(r'viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)', t)
+    if m:
+        return round(float(m.group(1))), round(float(m.group(2)))
+    w, h = re.search(r'<svg[^>]*\swidth="([\d.]+)', t), re.search(r'<svg[^>]*\sheight="([\d.]+)', t)
+    return (round(float(w.group(1))), round(float(h.group(1)))) if w and h else (100, 100)
+
+
+def rango_slide(texto: str, n: int) -> tuple[int, int]:
+    e = Estructura()
+    e.feed(texto)
+    if not 1 <= n <= len(e.slides):
+        die(f'no hay slide {n}; la presentación tiene {len(e.slides)}.')
+    s = e.slides[n - 1]
+    inicios = [0]
+    for linea in texto.split('\n'):
+        inicios.append(inicios[-1] + len(linea) + 1)
+    return inicios[s['ini'] - 1], inicios[min(s['fin'], len(inicios) - 1)]
+
+
+def poner_en_hueco(texto: str, cual: str, src: str, tam: tuple[int, int], alt: str = '') -> tuple[str, str]:
+    """Reemplaza el recuadro K de la slide N («N» o «N:K») por la imagen, ajustada a su caja."""
+    n, _, k = cual.partition(':')
+    try:
+        n, k = int(n), int(k or 1)
+    except ValueError:
+        die(f'--hueco va como N o N:K (slide y número de recuadro), no «{cual}».')
+    ini, fin = rango_slide(texto, n)
+    huecos = list(HUECO_RE.finditer(texto, ini, fin))
+    if not huecos:
+        die(f'la slide {n} no tiene recuadros para completar.')
+    if not 1 <= k <= len(huecos):
+        die(f'la slide {n} tiene {len(huecos)} recuadros; pediste el {k}.')
+    m = huecos[k - 1]
+    extra, estilo, descripcion = m.group(1).split(), m.group(2), texto_plano(m.group(4))
+    medida = lambda p: float(x.group(1)) if (x := re.search(rf'(?<![\w-]){p}\s*:\s*(-?[\d.]+)px', estilo)) else None
+    L, T, w, h = medida('left'), medida('top'), medida('width'), medida('height')
+    if None in (L, T, w):
+        die(f'el recuadro {k} de la slide {n} no tiene posición en px.')
+    h = h or w
+    alt = alt or descripcion
+    if 'circulo' in extra or 'cubrir' in extra:
+        clases = ' '.join(['el'] + [c for c in extra if c in ('circulo', 'cubrir', 'sangrado')])
+        st = f'left:{round(L)}px;top:{round(T)}px;width:{round(w)}px;height:{round(h)}px'
+    else:
+        iw, ih = tam
+        f = min(w / iw, h / ih)
+        ww, hh = iw * f, ih * f
+        clases = ' '.join(['el'] + [c for c in extra if c == 'sangrado'])
+        st = f'left:{round(L + (w - ww) / 2)}px;top:{round(T + (h - hh) / 2)}px;width:{round(ww)}px'
+    img = f'<img class="{clases}" src="{esc(src)}" alt="{esc(alt)}" style="{st}">'
+    return texto[:m.start()] + img + texto[m.end():], descripcion
+
+
+def cmd_imagen(a) -> None:
+    deck = resolver_deck(a.archivo)
+    texto = deck.read_text(encoding='utf-8')
+    W, H = medidas(texto)
+    mq = Maquetador('', W, H, deck.parent, Path.cwd())
+    src, tam = mq.traer(a.fuente)
+    if not src:
+        die((mq.avisos[0] if mq.avisos else f'no pude traer {a.fuente}').replace('; quedó un recuadro', ''))
+    if not a.hueco:
+        print(f'Guardada: {src} ({tam[0]}×{tam[1]} px). Para usarla: <img class="el" src="{src}" alt="" style="left:…px;top:…px;width:…px">')
+        return
+    nuevo, desc = poner_en_hueco(texto, a.hueco, src, tam, a.alt or '')
+    respaldar(deck, cada=0)
+    escribir(deck, nuevo)
+    print(f'Puse {src} en el recuadro «{desc[:60]}» (slide {a.hueco.split(":")[0]}).')
+    if a.fuente.startswith(('http://', 'https://')):
+        print('  Dejá el origen y la licencia de la imagen en las notas de esa slide.')
+
+
+def cmd_qr(a) -> None:
+    deck = resolver_deck(a.archivo)
+    if not shutil.which('uv'):
+        die('para hacer QR hace falta uv (https://docs.astral.sh/uv/).')
+    codigo = ('import segno, sys\n'
+              'q = segno.make(sys.argv[1], error="m")\n'
+              'q.save(sys.stdout.buffer, kind="svg", border=2, scale=10, dark="#000", light="#fff", xmldecl=False)\n')
+    r = subprocess.run(['uv', 'run', '--quiet', '--no-project', '--with', 'segno', 'python', '-c', codigo, a.url],
+                       capture_output=True, timeout=120)
+    if r.returncode or b'<svg' not in r.stdout:
+        die('no pude generar el QR: ' + r.stderr.decode('utf-8', 'replace').strip()[-300:])
+    slug = re.sub(r'[^\w]+', '-', re.sub(r'^https?://(www\.)?', '', a.url)).strip('-')[:40] or 'link'
+    src = guardar_imagen(deck.parent, f'qr-{slug}', '.svg', r.stdout)
+    if not a.hueco:
+        print(f'Guardado: {src}. Para usarlo: <img class="el" src="{src}" alt="QR" style="left:…px;top:…px;width:…px">')
+        return
+    texto = deck.read_text(encoding='utf-8')
+    nuevo, desc = poner_en_hueco(texto, a.hueco, src, (1, 1), f'QR: {a.url}')
+    respaldar(deck, cada=0)
+    escribir(deck, nuevo)
+    print(f'Puse el QR de {a.url} en el recuadro «{desc[:60]}» (slide {a.hueco.split(":")[0]}).')
 
 
 def medidas(texto: str) -> tuple[int, int]:
@@ -2711,6 +2861,19 @@ def main() -> None:
     s.add_argument('--despues', type=int, help='después de qué slide (0 = al principio; por defecto, al final)')
     s.set_defaults(fn=cmd_agregar)
 
+    s = sub.add_parser('imagen', help='traer una imagen (archivo o URL) a img/ y ponerla en un recuadro')
+    s.add_argument('archivo')
+    s.add_argument('fuente', help='ruta o URL de la imagen')
+    s.add_argument('--hueco', help='recuadro a reemplazar: N (el primero de la slide N) o N:K')
+    s.add_argument('--alt', help='texto alternativo (por defecto, el del recuadro)')
+    s.set_defaults(fn=cmd_imagen)
+
+    s = sub.add_parser('qr', help='código QR de un link, en img/ y opcionalmente en un recuadro')
+    s.add_argument('archivo')
+    s.add_argument('url')
+    s.add_argument('--hueco', help='recuadro a reemplazar: N o N:K')
+    s.set_defaults(fn=cmd_qr)
+
     s = sub.add_parser('importar', help='convertir un .pptx o .pdf')
     s.add_argument('archivo', help='.pptx (PowerPoint o Google Slides bajado como PowerPoint) o .pdf')
     s.add_argument('--salida', help='carpeta de salida (por defecto, NOMBRE-diapo al lado del original)')
@@ -2725,7 +2888,7 @@ def main() -> None:
     s.add_argument('--puerto', type=int, default=8765)
     s.add_argument('--no-abrir', action='store_true', help='no abrir el navegador')
     s.add_argument('--editar', action='store_true', help='abrir directo en modo edición')
-    s.add_argument('--modelo', help='modelo para el chat (por ejemplo sonnet u opus); por defecto, el de tus ajustes de Claude Code')
+    s.add_argument('--modelo', help='modelo para el chat: opus (por defecto, o el de diapo config) o sonnet para cambios rápidos')
     s.set_defaults(fn=cmd_ver)
 
     s = sub.add_parser('revisar', help='buscar problemas y sacar capturas de cada slide')
@@ -2761,6 +2924,7 @@ def main() -> None:
     s = sub.add_parser('config', help='tu nombre y tu mail para la portada de las presentaciones nuevas')
     s.add_argument('--nombre')
     s.add_argument('--mail')
+    s.add_argument('--modelo-chat', dest='modelo_chat', help='modelo del chat de diapo ver: opus, sonnet, haiku o un id completo')
     s.set_defaults(fn=cmd_config)
 
     a = ap.parse_args()

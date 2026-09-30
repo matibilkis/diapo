@@ -39,6 +39,10 @@ Eso instala el skill (y trae el CLI adentro del plugin). Para usar `diapo` vos m
 
 ```bash
 diapo nuevo mi-charla --tema oscuro --titulo "Mi charla"   # o --tema claro, para clases
+diapo nuevo clase-3 --tema claro --desde guion.md           # armada desde un guion en markdown
+diapo agregar clase-3/clase-3.html --desde mas.md           # sumar slides desde otro guion
+diapo imagen clase-3/clase-3.html foto.jpg --hueco 4        # una imagen (o URL) en el recuadro de la slide 4
+diapo qr clase-3/clase-3.html https://… --hueco 1:2         # un QR en el segundo recuadro de la portada
 diapo importar deck.pptx                                   # Google Slides: Archivo → Descargar → PowerPoint
 diapo importar apunte.pdf                                  # una imagen por página, el texto va a las notas
 diapo ver mi-charla/mi-charla.html                         # editar en el navegador (y chatear con Claude)
@@ -61,7 +65,7 @@ diapo config --nombre "Tu nombre" --mail "vos@correo"      # lo que va en la por
 
 ## Trabajar con Claude
 
-- **El panel de chat** (tecla **C**): le pedís cambios y sabe en qué slide estás y qué elemento tenés elegido. Antes de mandar, la página guarda tus cambios; antes de cada pedido queda un respaldo en `.diapo/respaldos/`. Los cambios entran sin recargar y Ctrl+Z los deshace. Atrás corre Claude Code sin ventana con tu cuenta, y esa sesión solo puede editar ese archivo y correr `diapo revisar` y `diapo pedidos`.
+- **El panel de chat** (tecla **C**): le pedís cambios y sabe en qué slide estás y qué elemento tenés elegido. Antes de mandar, la página guarda tus cambios; antes de cada pedido queda un respaldo en `.diapo/respaldos/`. Los cambios entran sin recargar y Ctrl+Z los deshace. Atrás corre Claude Code sin ventana con tu cuenta, en Opus por defecto (`diapo ver --modelo sonnet` para cambios rápidos, o `diapo config --modelo-chat`). Puede armar slides nuevas desde un guion, buscar y verificar datos en la web y traer imágenes, pero solo escribe en la presentación, su `img/` y `.diapo/`, y solo corre los comandos de diapo.
 - **Desde la terminal**: cualquier sesión de Claude Code edita el `.html` como cualquier otro archivo. Mientras lo tengas abierto con `diapo ver`, la página se actualiza sola con lo que escriba.
 - **Pedidos**: el botón «Pedido» deja un encargo en un elemento o en una slide. Claude los ve con `diapo pedidos` y borra el atributo `data-pedido` cuando los resuelve.
 

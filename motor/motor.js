@@ -1063,7 +1063,7 @@ async function renderTex(root = deck) {
 
 /* chat con Claude: el servidor de `diapo ver` le pasa los pedidos a Claude Code sin ventana */
 const CHAT_KEY = KEY + ':chat';
-let chatOpen = false, chatWanted = false, chatBusy = false, chatT0 = 0, chatTimer = 0;
+let chatOpen = false, chatWanted = false, chatBusy = false, chatT0 = 0, chatTimer = 0, chatPaso = '';
 let chatLog = [];
 function chatAdd(rol, texto, extra) { chatLog.push({ rol, texto, ...(extra || {}) }); if (chatLog.length > 300) chatLog = chatLog.slice(-300); chatRender(); }
 function chatFmt(t) { return esc(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>'); }
@@ -1124,8 +1124,8 @@ function chatSetBusy(b) {
   $('button[type="submit"]', p).disabled = b;
   clearInterval(chatTimer);
   const st = $('.cp-estado', p);
-  if (b) { chatT0 = chatT0 || Date.now(); const tic = () => { st.textContent = `Claude está trabajando · ${Math.round((Date.now() - chatT0) / 1000)} s`; }; tic(); chatTimer = setInterval(tic, 1000); }
-  else { chatT0 = 0; st.textContent = ''; }
+  if (b) { chatT0 = chatT0 || Date.now(); const tic = () => { st.textContent = `Claude está trabajando · ${Math.round((Date.now() - chatT0) / 1000)} s` + (chatPaso ? ` · ${chatPaso}` : ''); }; tic(); chatTimer = setInterval(tic, 1000); }
+  else { chatT0 = 0; chatPaso = ''; st.textContent = ''; }
 }
 async function chatPost(que, body) {
   try {
@@ -1154,7 +1154,7 @@ function chatEvent(d) {
   switch (d.tipo) {
     case 'pensando': chatSetBusy(true); break;
     case 'modelo': if (SERVER) SERVER.modelo = d.modelo; chatHead(); break;
-    case 'paso': chatAdd('paso', d.texto); break;
+    case 'paso': chatPaso = d.texto; chatAdd('paso', d.texto); break;
     case 'texto': chatAdd('claude', d.texto); break;
     case 'info': chatAdd('info', d.texto); break;
     case 'fin': chatSetBusy(false); if (d.ok) chatAdd('meta', `${d.segundos} s`); else chatAdd('error', d.texto || 'Claude no terminó bien.'); break;

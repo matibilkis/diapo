@@ -21,7 +21,9 @@ Las ecuaciones se escriben en LaTeX dentro del texto, `$…$` en línea y `$$…
 | `diapo ver ARCHIVO.html [--editar] [--modelo sonnet]` | Servidor local. Ctrl+S guarda en el archivo; cuando Claude lo cambia, la página se actualiza sin recargar y Ctrl+Z deshace ese cambio. Trae el panel de chat (tecla C). Lo corre el usuario (sugerirle `! diapo ver …`). |
 | `diapo revisar ARCHIVO.html [--slides 3,5-7] [--json]` | Renderiza sin ventana. Lista textos fuera del lienzo, textos que se pisan, cajas desbordadas, imágenes rotas, tipografías que no cargaron, recuadros para completar y pedidos. Deja capturas y hojas de contacto en `.diapo/revision/`. |
 | `diapo pedidos ARCHIVO.html [--json]` | Lista los pedidos que dejó con el botón «Pedido». |
-| `diapo config --nombre "…" --mail "…"` | Lo que va en la portada de las presentaciones nuevas. |
+| `diapo imagen ARCHIVO.html RUTA\|URL [--hueco N[:K]]` | Trae la imagen a `img/` (WebP, achicada) y reemplaza el recuadro K de la slide N ajustándola a su caja; los recuadros `circulo` o `cubrir` se llenan. Sin `--hueco`, solo la guarda e imprime la ruta. |
+| `diapo qr ARCHIVO.html URL [--hueco N[:K]]` | QR en SVG (con `uv` y `segno`), en `img/` y opcionalmente en un recuadro. |
+| `diapo config --nombre "…" --mail "…" [--modelo-chat sonnet]` | Lo que va en la portada de las presentaciones nuevas, y el modelo del chat (Opus si no se indica). |
 | `diapo pdf ARCHIVO.html [-o salida.pdf]` | Una slide por página, con fondos. |
 | `diapo previa ARCHIVO.html` | Copia solo para mirar, en `.diapo/previa/`, más la lista de archivos que usa. Sirve para publicar un artifact. |
 | `diapo actualizar ARCHIVO.html` | Reemplaza el motor embebido por el actual. Deja un respaldo. |
@@ -71,7 +73,7 @@ Notas: lo que dice el orador; puede seguir en varias líneas hasta el final del 
 1. **Antes de escribir el archivo**, si el usuario lo tiene abierto, pedirle que guarde. Si guarda antes de que Claude escriba, su página se actualiza sola con los cambios, sin recargar, y Ctrl+Z los deshace. Si tenía cambios sin guardar, la página le avisa en vez de pisarlos. Al guardar le pregunta si reemplaza la versión de Claude, que igual queda en `.diapo/respaldos/` (se guardan las últimas 50, como mucho una por minuto al guardar, más una antes de cada pedido al chat).
 2. **Pedidos**: correr `diapo pedidos ARCHIVO.html`, resolver cada uno y borrar su `data-pedido`. Si un pedido no se entiende o no se puede resolver, dejarlo y decirlo.
 3. **Editar con Edit, no reescribir el archivo**. Cambios puntuales, sin reformatear lo demás ni tocar el motor. Para ubicar una slide, buscar su `data-titulo`.
-4. **Imágenes**: guardarlas en `img/` y referenciarlas con ruta relativa. Si falta la imagen, dejar un `hueco` con la descripción de lo que va.
+4. **Imágenes**: `diapo imagen` para ponerlas en su recuadro; si se agregan a mano, van en `img/` con ruta relativa. Las de la web, con licencia libre y el origen en las notas. Si falta la imagen, dejar un `hueco` con la descripción de lo que va.
 5. **Después de editar**: `diapo revisar ARCHIVO.html --slides N,M` y mirar las capturas (`.diapo/revision/slide-NN.png`) con Read. No dar por buena una slide sin mirarla.
 6. **Contenido incremental**: armar la estructura y de a un bloque por vez con el usuario, en su tono. Para varias slides nuevas, guion y `diapo agregar`; para una sola parecida a otra, copiar su estructura.
 
@@ -79,7 +81,8 @@ Notas: lo que dice el orador; puede seguir en varias líneas hasta el final del 
 
 El usuario le pide cambios a Claude sin salir de la presentación. El servidor levanta Claude Code sin ventana (`claude -p`, entrada y salida stream-json, `--safe-mode`) con su cuenta, una conversación por presentación, y le pasa cada mensaje con el contexto: slide, título, líneas del archivo y elemento elegido.
 
-- Esa sesión solo puede editar ese `.html` (`--allowedTools Edit(./ARCHIVO)`) y correr `diapo revisar` y `diapo pedidos`. Cualquier otra escritura la frena el permiso.
+- Corre en Opus salvo `--modelo` o `diapo config --modelo-chat`. Puede leer, buscar en la web (WebSearch, WebFetch), escribir solo en el `.html`, `img/` y `.diapo/` (reglas `Edit(./…)`), y correr `diapo revisar|pedidos|agregar|imagen|qr|pdf`. Otra escritura o comando lo frena el permiso.
+- Recibe con cada mensaje el HTML de la slide que se está mirando. Para pedidos grandes escribe `.diapo/guion.md` y usa `diapo agregar`; los datos los verifica en la web y deja la fuente.
 - Antes de mandar, la página guarda; antes de cada mensaje, el servidor deja un respaldo. La conversación sigue después de cerrar: la sesión queda en `.diapo/chat.json` y lo que se ve en el panel, en `.diapo/chat-NOMBRE.json`.
 - Las reglas del formato y del tono que recibe esa sesión están en `reglas_chat()`, dentro del CLI. Si cambia el formato del archivo, actualizarlas ahí.
 - Una sesión de Claude Code normal (esta) edita el mismo archivo igual que siempre; el chat no reemplaza el trabajo desde la terminal.
