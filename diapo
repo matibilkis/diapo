@@ -48,6 +48,7 @@ from xml.etree import ElementTree as ET
 RAIZ = Path(__file__).resolve().parent
 MOTOR_JS = RAIZ / 'motor' / 'motor.js'
 MOTOR_CSS = RAIZ / 'motor' / 'motor.css'
+KATEX = RAIZ / 'motor' / 'katex'
 TEMAS = RAIZ / 'temas'
 VERSION = '1'
 UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
@@ -172,6 +173,14 @@ def armar(titulo: str, secciones: str, *, archivo: str, ancho: int = 1280, alto:
     return '\n'.join(partes)
 
 
+def copiar_katex(carpeta: Path) -> None:
+    """KaTeX al lado de la presentación, para las ecuaciones $…$ sin internet."""
+    dest = carpeta / 'katex'
+    if (dest / 'VERSION').exists() and (dest / 'VERSION').read_bytes() == (KATEX / 'VERSION').read_bytes():
+        return
+    shutil.copytree(KATEX, dest, dirs_exist_ok=True)
+
+
 def copiar_fuentes(tdir: Path, carpeta: Path) -> None:
     src = tdir / 'fonts'
     if not src.is_dir():
@@ -201,6 +210,7 @@ def cmd_nuevo(a) -> None:
     carpeta.mkdir(parents=True, exist_ok=True)
     (carpeta / 'img').mkdir(exist_ok=True)
     copiar_fuentes(tdir, carpeta)
+    copiar_katex(carpeta)
     titulo = a.titulo or archivo.stem.replace('-', ' ').replace('_', ' ').strip().capitalize()
     c = config()
     secciones = (tdir / 'inicio.html').read_text(encoding='utf-8')
@@ -1505,6 +1515,7 @@ def cmd_importar(a) -> None:
         respaldar(archivo, cada=0)
     escribir(archivo, html_)
     carpeta_oculta(carpeta)
+    copiar_katex(carpeta)
     print(f'Importada: {archivo}')
     print(f'  {info["slides"]} slides, lienzo {info["lienzo"]}')
     for k, v in sorted(info.get('detalle', {}).items()):
@@ -1594,6 +1605,7 @@ Formato del archivo:
 - Lo movible es hijo directo de la slide, con la clase el y style="left:…px;top:…px;width:…px" sobre un lienzo de {W}×{H}. El orden en el archivo es el orden de apilado.
 - Textos: <div class="el ESTILO">. Links: <a class="el fuente" href="…" target="_blank" rel="noopener">[sitio]</a>. Imágenes: <img class="el" src="img/…" alt="">. Recuadro para completar: <div class="el hueco" style="…;height:…px">qué va</div>.
 - Notas del orador: <aside class="notas"> al final de cada slide.
+- Ecuaciones: LaTeX entre $…$ (en línea) o $$…$$ (en bloque) dentro del texto; la página las muestra con KaTeX. No armes fracciones con HTML ni CSS.
 - Estilos del tema: {estilos}. Fondos de slide: {fondos}. Colores: {colores}. Usá estas clases y variables en vez de tipografías o colores sueltos.
 - No toques <style id="motor-css">, <script id="motor"> ni <style id="fuentes">.
 
@@ -1990,6 +2002,7 @@ class Servidor(SimpleHTTPRequestHandler):
 
 def cmd_ver(a) -> None:
     deck = resolver_deck(a.archivo)
+    copiar_katex(deck.parent)
     Servidor.raiz = deck.parent.resolve()
     Servidor.modelo = getattr(a, 'modelo', None)
     handler = lambda *args, **kw: Servidor(*args, directory=str(Servidor.raiz), **kw)
@@ -2070,6 +2083,8 @@ CHEQUEO_JS = r"""
       }
       if (el.tagName === 'IMG' && (!el.complete || el.naturalWidth === 0)) out.push({n, tipo: 'imagen que no carga', txt: el.getAttribute('src') || ''});
       if (el.classList.contains('hueco')) out.push({n, tipo: 'recuadro para completar', txt: corto(el)});
+      el.querySelectorAll('.katex-error, .tex-error').forEach(e => out.push({n, tipo: 'ecuación con error', txt: (e.textContent || '').slice(0, 60), det: (e.getAttribute('title') || '').replace(/^KaTeX parse error: /, '').slice(0, 120)}));
+      if (/\$[^$]+\$/.test(el.textContent || '') && !el.querySelector('.tex') && !window.katex) out.push({n, tipo: 'ecuación sin renderizar (falta la carpeta katex/; correr diapo actualizar)', txt: corto(el)});
       if (el.dataset.pedido) out.push({n, tipo: 'pedido a Claude', txt: corto(el), det: el.dataset.pedido});
     });
     if (s.dataset.pedido) out.push({n, tipo: 'pedido a Claude', txt: '(toda la slide)', det: s.dataset.pedido});
@@ -2109,6 +2124,7 @@ def abrir_navegador(deck: Path, ancho: int, alto: int):
     pg.on('pageerror', lambda e: errores.append(str(e)))
     pg.goto(deck.as_uri())
     pg.wait_for_timeout(400)
+    pg.evaluate('window.diapo && window.diapo.tex ? window.diapo.tex() : null')
     pg.evaluate('Promise.all([...document.fonts].map(f => f.load().catch(() => null)))')
     pg.evaluate('Promise.all([...document.images].map(i => i.decode ? i.decode().catch(() => null) : null))')
     pg.wait_for_timeout(200)
@@ -2455,6 +2471,7 @@ def cmd_agregar(a) -> None:
     nuevo = '\n'.join(lineas[:corte] + [''] + '\n\n'.join(secciones).split('\n') + lineas[corte:])
     respaldar(deck, cada=0)
     escribir(deck, nuevo)
+    copiar_katex(deck.parent)
     print(f'Agregadas {len(secciones)} slides a {deck.name}: de la {n + 1} a la {n + len(secciones)}.')
     for av in avisos:
         print(f'  ojo: {av}')
@@ -2647,6 +2664,7 @@ def cmd_actualizar(a) -> None:
     t2 = re.sub(r'(<style id="motor-css">)(.*?)(</style>)', lambda m: f'{m.group(1)}\n{nuevo_css}\n{m.group(3)}', texto, count=1, flags=re.S)
     t2 = re.sub(r'(<script id="motor">)(.*?)(</script>)', lambda m: f'{m.group(1)}\n{nuevo_js}\n{m.group(3)}', t2, count=1, flags=re.S)
     t2 = re.sub(r'<meta name="generator" content="diapo [^"]*">', f'<meta name="generator" content="diapo {VERSION}">', t2, count=1)
+    copiar_katex(deck.parent)
     if t2 == texto:
         print(f'{deck.name} ya tenía el motor al día.')
         return
@@ -2668,6 +2686,8 @@ def cmd_previa(a) -> None:
     dest = carpeta_oculta(deck.parent, 'previa') / deck.name
     dest.write_text(t, encoding='utf-8')
     refs = sorted(set(re.findall(r'''(?:src|href)="((?:img|fonts)/[^"#?]+)"''', texto)) | set(re.findall(r'url\(((?:img|fonts)/[^)]+)\)', texto)))
+    if '$' in texto and (deck.parent / 'katex').is_dir():
+        refs += sorted(str(f.relative_to(deck.parent)) for f in (deck.parent / 'katex').rglob('*') if f.is_file() and f.suffix in ('.js', '.css', '.woff2'))
     refs = [r for r in refs if (deck.parent / r).exists()]
     print(json.dumps({'archivo': str(dest), 'raiz': str(deck.parent), 'archivos': refs}, ensure_ascii=False, indent=1))
 

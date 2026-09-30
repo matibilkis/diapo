@@ -7,7 +7,7 @@ description: Presentaciones HTML de un solo archivo que el usuario edita en el n
 
 Comando: `diapo`. Si no está en el PATH, el CLI es el archivo `diapo` que está dos carpetas más arriba de este skill: correlo con `python3 RUTA/diapo`. Cada presentación es un `.html` con carpetas `img/` y `fonts/` al lado; no hace falta internet para verla ni para editarla.
 
-diapo no renderiza LaTeX: para decks con muchas ecuaciones conviene otra herramienta.
+Las ecuaciones se escriben en LaTeX dentro del texto, `$…$` en línea y `$$…$$` en bloque, y se ven con KaTeX sin internet (carpeta `katex/` al lado del archivo). En el HTML queda la fuente: editar la fórmula es editar ese texto. Un `$` suelto seguido de un número (`$5`) no se toma como ecuación.
 
 ## Comandos
 
@@ -90,7 +90,7 @@ El usuario le pide cambios a Claude sin salir de la presentación. El servidor l
 
 ## Límites
 
-- No renderiza LaTeX ni ecuaciones: usar una imagen o el stack Typst.
+- KaTeX cubre la matemática de LaTeX, no TikZ ni diagramas: esos van como imagen. `revisar` marca las ecuaciones con error de sintaxis.
 - No tiene animaciones ni transiciones.
 - Abierto como archivo, sin `diapo ver`: Ctrl+S guarda encima en Chrome o Edge, y la primera vez pide elegir el archivo. En Firefox baja una copia.
 - Un `.html` que no tenga los bloques `#motor-css` y `#motor` no es formato diapo: `actualizar` no lo toca.

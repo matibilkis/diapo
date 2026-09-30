@@ -481,7 +481,7 @@ function startEdit(el, selectAll = false) {
   if (editing && editing !== el) endEdit();
   if (editing === el) return;
   sel = el; syncBar();
-  snapshot(); el._antes = el.innerHTML;
+  snapshot(); untex(el); el._antes = el.innerHTML;
   editing = el; el.contentEditable = 'true'; el.classList.add('escribiendo');
   html.classList.add('escribiendo-texto');
   el.focus({ preventScroll: true });
@@ -495,6 +495,7 @@ function endEdit() {
   html.classList.remove('escribiendo-texto');
   if (el.innerHTML === el._antes) undoStack.pop(); else markDirty();
   delete el._antes;
+  renderTex(el);
   const s = getSelection(); if (s) s.removeAllRanges();
   positionFrame();
 }
@@ -862,6 +863,7 @@ function serialize() {
   const keep = n => n.matches('meta, title') || (n.matches('link') && /fonts\.(googleapis|gstatic)\.com/.test(n.getAttribute('href') || '')) || (n.matches('style') && HEAD_IDS.includes(n.id));
   const head = [...doc.head.children].filter(keep).map(n => n.outerHTML).join('\n');
   const d = deck.cloneNode(true);
+  untex(d);
   d.removeAttribute('style');
   $$('.slide', d).forEach(s => { s.classList.remove('actual'); s.removeAttribute('data-n'); });
   $$('[contenteditable]', d).forEach(n => n.removeAttribute('contenteditable'));
@@ -1004,12 +1006,58 @@ async function hotSwap() {
   if (nd.title && !PRES) doc.title = nd.title;
   deck.innerHTML = nuevo.innerHTML;
   sel = null; refresh();
+  renderTex();
   if (($('#tema') || {}).textContent + ($('#estilos') || {}).textContent !== antes) rebuildBar();
   go(Math.min(idx, slides.length - 1), { remote: true });
   if (overviewOpen) openOverview();
   if (h) SERVER.hash = h; else { try { const r = await fetch('/__diapo/estado?archivo=' + encodeURIComponent(SERVER.archivo), { cache: 'no-store' }); SERVER.hash = (await r.json()).hash; } catch (_) {} }
   markClean();
   if (!chatOpen && !PRES) toast('La presentación cambió afuera y ya está al día. Ctrl+Z deshace el cambio.', 3600);
+  return true;
+}
+
+/* ecuaciones: $…$ y $$…$$ en los textos, con KaTeX de la carpeta katex/ que está al lado del archivo */
+const TEX_RE = /\$\$([\s\S]+?)\$\$|\$(?=\S)((?:\\\$|[^$\n])+?)(?<=\S)\$(?!\d)/g;
+function loadKatex() {
+  if (window.katex) return Promise.resolve(true);
+  if (!loadKatex.p) loadKatex.p = new Promise(res => {
+    doc.head.appendChild(mk('link', { rel: 'stylesheet', href: 'katex/katex.min.css' }));
+    const sc = mk('script', { src: 'katex/katex.min.js' });
+    sc.onload = () => res(!!window.katex); sc.onerror = () => res(false);
+    doc.head.appendChild(sc);
+  });
+  return loadKatex.p;
+}
+function texEl(el) {
+  const tw = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT, { acceptNode: n => n.parentNode.closest('.tex, code, pre') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+  const nodos = []; while (tw.nextNode()) if (tw.currentNode.nodeValue.includes('$')) nodos.push(tw.currentNode);
+  nodos.forEach(n => {
+    const t = n.nodeValue; let last = 0, m, hubo = false;
+    const frag = doc.createDocumentFragment();
+    TEX_RE.lastIndex = 0;
+    while ((m = TEX_RE.exec(t))) {
+      hubo = true;
+      if (m.index > last) frag.appendChild(doc.createTextNode(t.slice(last, m.index)));
+      const bloque = m[1] != null, src = bloque ? m[1] : m[2];
+      const sp = mk('span', { class: 'tex', 'data-tex': src, contenteditable: 'false' });
+      if (bloque) sp.setAttribute('data-bloque', '');
+      try { window.katex.render(src, sp, { displayMode: bloque, throwOnError: false }); } catch (_) { sp.textContent = m[0]; sp.classList.add('tex-error'); }
+      frag.appendChild(sp); last = m.index + m[0].length;
+    }
+    if (!hubo) return;
+    if (last < t.length) frag.appendChild(doc.createTextNode(t.slice(last)));
+    n.parentNode.replaceChild(frag, n);
+  });
+}
+function untex(root) {
+  $$('span.tex', root).forEach(sp => { const d = sp.hasAttribute('data-bloque') ? '$$' : '$'; sp.replaceWith(doc.createTextNode(d + sp.dataset.tex + d)); });
+  root.normalize();
+}
+async function renderTex(root = deck) {
+  if (!/\$[^$]+\$/.test(root.textContent || '')) return false;
+  if (!(await loadKatex())) return false;
+  (root.matches && root.matches('.el') ? [root] : $$('.el', root)).forEach(el => { if (el !== editing) texEl(el); });
+  positionFrame();
   return true;
 }
 
@@ -1185,8 +1233,9 @@ function init() {
   if (re) { store('del', KEY + ':reabrir'); try { const o = JSON.parse(re); if (o.editar) toggleEdit(true); if (o.notas) toggleNotes(true); if (o.chat) chatWanted = true; } catch (_) {} }
   else if (params.has('editar')) toggleEdit(true);
   detectServer();
+  renderTex();
   window.deckAPI = window.diapo = {
-    version: VERSION, go, next, prev, serialize, save, toggleEdit, moveSlide, undo, redo, openOverview, closeOverview, toggleNotes,
+    version: VERSION, go, next, prev, serialize, tex: () => renderTex(), save, toggleEdit, moveSlide, undo, redo, openOverview, closeOverview, toggleNotes,
     select: el => select(el), setVar, pedidos: () => $$('[data-pedido]', deck).map(el => ({ slide: slides.indexOf(el.closest('section.slide')) + 1, texto: el.dataset.pedido })),
     get idx() { return idx; }, get total() { refresh(); return slides.length; }, get sel() { return sel; }, get dirty() { return dirty; },
     get editing() { return editing; }, get scale() { return scale; }, get servidor() { return SERVER; },

@@ -79,11 +79,11 @@ Cada slide es un `<section class="slide">` dentro de `<div id="deck">`. Lo movib
 
 ## Límites
 
-- No renderiza LaTeX ni ecuaciones: poné una imagen, o usá otra herramienta para esos decks.
+- Ecuaciones: LaTeX entre `$…$` o `$$…$$`, con KaTeX incluido (anda sin internet). No hay TikZ ni diagramas: para eso, una imagen.
 - No tiene animaciones ni transiciones.
 - Probado en Linux con Chromium y Chrome. Firefox, Mac y Windows no están probados.
 - Abierta como archivo, sin `diapo ver`, Ctrl+S guarda encima en Chrome y Edge; en Firefox baja una copia.
 
 ## Licencia
 
-Código: MIT (ver `LICENSE`). Las tipografías que vienen con los temas son SIL OFL 1.1: detalle en `temas/FUENTES.md`.
+Código: MIT (ver `LICENSE`). Las tipografías que vienen con los temas son SIL OFL 1.1: detalle en `temas/FUENTES.md`. Incluye KaTeX 0.18.9 (MIT, `motor/katex/LICENSE`).

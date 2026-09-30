@@ -18,6 +18,8 @@ img.el{display:block;height:auto}
 .caja{border:2px solid color-mix(in srgb,currentColor 35%,transparent);border-radius:12px;padding:14px 18px;background:color-mix(in srgb,currentColor 4%,transparent)}
 .hueco{border:3px dashed color-mix(in srgb,currentColor 45%,transparent);border-radius:10px;color:color-mix(in srgb,currentColor 60%,transparent);font:300 22px/1.35 var(--f-cuerpo,system-ui,sans-serif);display:flex;align-items:center;justify-content:center;text-align:center;padding:18px;background:color-mix(in srgb,currentColor 3%,transparent)}
 .circulo{border-radius:50%;object-fit:cover}
+.el .katex-display{margin:.2em 0}
+.el .tex-error{color:#c62828}
 .cubrir{object-fit:cover}
 .tabla{border-collapse:collapse;width:100%}
 .tabla td,.tabla th{padding:10px 12px;border-bottom:1px solid color-mix(in srgb,currentColor 22%,transparent);vertical-align:top;text-align:left}
