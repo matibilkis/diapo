@@ -2,7 +2,8 @@
 """diapo · presentaciones HTML que se editan en el navegador y se arman junto con Claude.
 
 Comandos:
-  nuevo       crea una presentación a partir de un tema
+  nuevo       crea una presentación a partir de un tema (o de un guion en markdown)
+  agregar     suma slides escritas en un guion markdown
   importar    convierte un .pptx (PowerPoint o Google Slides) o un .pdf
   ver         la abre con un servidor local: guarda directo y se recarga sola si Claude cambia el archivo
   revisar     la renderiza sin ventana, busca problemas y saca capturas para mirar
@@ -203,6 +204,24 @@ def cmd_nuevo(a) -> None:
     titulo = a.titulo or archivo.stem.replace('-', ' ').replace('_', ' ').strip().capitalize()
     c = config()
     secciones = (tdir / 'inicio.html').read_text(encoding='utf-8')
+    avisos: list[str] = []
+    if a.desde:
+        guion = Path(a.desde).expanduser()
+        if not guion.exists():
+            die(f'no existe {guion}')
+        estilos = (tdir / 'estilos.css').read_text(encoding='utf-8')
+        generadas, bloques, avisos = guion_a_secciones(guion, estilos, 1280, 720, carpeta)
+        portada = secciones.split('</section>')[0] + '</section>'
+        b0 = bloques[0] if bloques else None
+        if b0 and b0['titulo'] and not any(b0['cols']) and not b0['imagenes'] and not b0['cita'] and not b0['ecuaciones']:
+            generadas = generadas[1:]
+            titulo = a.titulo or texto_plano(b0['titulo'])
+            if b0['subtitulo']:
+                portada = re.sub(r'(<div class="el (?:subtitulo|portada-sub)"[^>]*>)(.*?)(</div>)',
+                                 lambda m: m.group(1) + b0['subtitulo'] + m.group(3), portada, count=1, flags=re.S)
+        elif not a.titulo:
+            titulo = guion.stem.replace('-', ' ').replace('_', ' ').strip().capitalize()
+        secciones = portada + '\n\n' + '\n\n'.join(generadas)
     for clave, valor in (('titulo', titulo), ('nombre', c.get('nombre') or 'Tu nombre'), ('mail', c.get('mail') or 'tu@correo')):
         secciones = secciones.replace('{{' + clave + '}}', esc(valor))
     escribir(archivo, armar(titulo, secciones, archivo=archivo.name,
@@ -212,7 +231,13 @@ def cmd_nuevo(a) -> None:
                             google=meta.get('google')))
     carpeta_oculta(carpeta)
     print(f'Lista: {archivo}')
-    print(f'Tema «{a.tema}», slides de ejemplo para reemplazar.')
+    if a.desde:
+        print(f'Tema «{a.tema}», portada más {secciones.count("<section") - 1} slides del guion.')
+        for av in avisos:
+            print(f'  ojo: {av}')
+        print(f'Revisala con: diapo revisar {archivo}')
+    else:
+        print(f'Tema «{a.tema}», slides de ejemplo para reemplazar.')
     print(f'Abrila con: diapo ver {archivo}')
 
 
@@ -2090,6 +2115,352 @@ def abrir_navegador(deck: Path, ancho: int, alto: int):
     return pw, b, pg, errores
 
 
+# ----------------------------------------------------------------------------
+# guion: markdown a slides con layouts, sin escribir coordenadas a mano
+# ----------------------------------------------------------------------------
+
+LAYOUTS = ('titulo-texto', 'titulo-imagen-der', 'dos-columnas', 'seccion', 'cita', 'imagen-completa', 'ecuacion')
+MATH = re.compile(r'(\$\$.+?\$\$|\$[^$\n]+?\$)', re.S)
+
+
+def md_inline(t: str) -> str:
+    partes = []
+    for i, trozo in enumerate(MATH.split(t)):
+        if i % 2:
+            partes.append(esc(trozo))
+            continue
+        s = esc(trozo)
+        s = re.sub(r'`([^`]+)`', r'<code>\1</code>', s)
+        s = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', s)
+        s = re.sub(r'(?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])', r'<i>\1</i>', s)
+        s = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)', r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
+        partes.append(s)
+    return ''.join(partes)
+
+
+def texto_plano(h: str) -> str:
+    return htmllib.unescape(re.sub(r'<[^>]+>', '', h)).strip()
+
+
+def leer_guion(texto: str) -> list[dict]:
+    """Un bloque por slide, separados por una línea «---»."""
+    bloques, actual = [], []
+    for linea in texto.replace('\r\n', '\n').split('\n'):
+        if linea.strip() == '---':
+            bloques.append(actual)
+            actual = []
+        else:
+            actual.append(linea)
+    bloques.append(actual)
+    slides = []
+    for lineas in bloques:
+        s = {'layout': None, 'fondo': None, 'titulo': '', 'subtitulo': '', 'cols': [[]], 'cita': [], 'autor': '',
+             'imagenes': [], 'ecuaciones': [], 'notas': [], 'fuentes': []}
+        parrafo: list[str] = []
+        notas = False
+        ecuacion = None
+
+        def cerrar():
+            if parrafo:
+                s['cols'][-1].append(('p', md_inline(' '.join(parrafo))))
+                parrafo.clear()
+
+        for crudo in lineas:
+            l = crudo.strip()
+            if ecuacion is not None:
+                if l.endswith('$$'):
+                    ecuacion.append(l[:-2])
+                    s['ecuaciones'].append('\n'.join(ecuacion).strip())
+                    ecuacion = None
+                else:
+                    ecuacion.append(l)
+                continue
+            m = re.fullmatch(r'<!--\s*(layout|fondo)\s*:\s*([\w-]+)\s*-->', l)
+            if m:
+                s[m.group(1)] = m.group(2)
+                continue
+            if notas:
+                s['notas'].append(crudo)
+                continue
+            m = re.match(r'(?i)notas\s*:\s*(.*)', l)
+            if m:
+                cerrar()
+                notas = True
+                if m.group(1):
+                    s['notas'].append(m.group(1))
+                continue
+            m = re.match(r'(?i)fuentes?\s*:\s*(.*)', l)
+            if m and '](' in m.group(1):
+                cerrar()
+                s['fuentes'] += re.findall(r'\[([^\]]+)\]\(([^)\s]+)\)', m.group(1))
+                continue
+            if not l:
+                cerrar()
+                continue
+            if l.startswith('## '):
+                cerrar()
+                s['subtitulo'] = md_inline(l[3:].strip())
+            elif l.startswith('# '):
+                cerrar()
+                s['titulo'] = md_inline(l[2:].strip())
+            elif l.startswith('>'):
+                cerrar()
+                s['cita'].append(md_inline(l.lstrip('> ').strip()))
+            elif s['cita'] and re.match(r'(—|--|–)\s*', l):
+                s['autor'] = md_inline(re.sub(r'^(—|--|–)\s*', '', l))
+            elif re.fullmatch(r'!\[([^\]]*)\]\(([^)\s]+)\)', l):
+                cerrar()
+                alt, ruta = re.fullmatch(r'!\[([^\]]*)\]\(([^)\s]+)\)', l).groups()
+                s['imagenes'].append(('img', ruta, alt))
+            elif re.fullmatch(r'\[imagen:\s*(.+)\]', l, re.I):
+                cerrar()
+                s['imagenes'].append(('hueco', re.fullmatch(r'\[imagen:\s*(.+)\]', l, re.I).group(1), ''))
+            elif l.startswith('$$'):
+                cerrar()
+                cuerpo = l[2:]
+                if cuerpo.endswith('$$') and len(cuerpo) >= 2:
+                    s['ecuaciones'].append(cuerpo[:-2].strip())
+                else:
+                    ecuacion = [cuerpo]
+            elif l == '|||':
+                cerrar()
+                s['cols'].append([])
+            elif re.match(r'([-*+]|\d+[.)])\s+', l):
+                cerrar()
+                s['cols'][-1].append(('li', md_inline(re.sub(r'^([-*+]|\d+[.)])\s+', '', l))))
+            else:
+                parrafo.append(l)
+        cerrar()
+        if ecuacion is not None:
+            s['ecuaciones'].append('\n'.join(ecuacion).strip())
+        if not any((s['titulo'], s['subtitulo'], any(s['cols']), s['cita'], s['imagenes'], s['ecuaciones'], s['notas'])):
+            continue
+        s['layout'] = s['layout'] if s['layout'] in LAYOUTS else inferir_layout(s)
+        slides.append(s)
+    return slides
+
+
+def inferir_layout(s: dict) -> str:
+    cuerpo = any(s['cols'])
+    if len(s['cols']) > 1:
+        return 'dos-columnas'
+    if s['ecuaciones']:
+        return 'ecuacion'
+    if s['cita'] and not cuerpo:
+        return 'cita'
+    if s['imagenes']:
+        return 'titulo-imagen-der' if cuerpo else 'imagen-completa'
+    if not cuerpo:
+        return 'seccion'
+    return 'titulo-texto'
+
+
+class Maquetador:
+    """Convierte bloques del guion en <section> con coordenadas, usando las clases que tenga el deck."""
+
+    def __init__(self, estilos_css: str, W: int, H: int, carpeta: Path, base: Path):
+        self.css, self.W, self.H, self.carpeta, self.base = estilos_css, W, H, carpeta, base
+        self.clases = set(re.findall(r'\.([A-Za-z][\w-]*)', estilos_css))
+        self.sx, self.sy = W / 1280, H / 720
+        self.avisos: list[str] = []
+
+    def clase(self, *opciones: str) -> str:
+        return next((c for c in opciones if c in self.clases), 'cuerpo')
+
+    def tam(self, clase: str) -> float:
+        m = re.search(r'\.' + re.escape(clase) + r'\{[^}]*?(\d+)px', self.css)
+        return float(m.group(1)) if m else 28.0
+
+    def caja(self, l, t, w, h=None, extra='') -> str:
+        st = f'left:{round(l * self.sx)}px;top:{round(t * self.sy)}px;width:{round(w * self.sx)}px'
+        if h is not None:
+            st += f';height:{round(h * self.sy)}px'
+        return st + (';' + extra if extra else '')
+
+    @staticmethod
+    def alto(items, px: float, ancho: float) -> float:
+        por_linea = max(8, ancho / (px * 0.5))
+        lineas = sum(max(1, math.ceil(len(texto_plano(h)) / por_linea)) for _, h in items)
+        return lineas * px * 1.35 + max(0, len(items) - 1) * px * 0.45
+
+    def texto(self, items, clase: str, l, t, w, alto_max, extra='') -> tuple[str, float]:
+        """Un bloque de texto; si no entra, achica la letra hasta un 70 %."""
+        if not items:
+            return '', 0
+        solo_lista = all(k == 'li' for k, _ in items)
+        if solo_lista and 'vinetas' in self.clases:
+            clase = 'vinetas'
+            ps = ''.join(f'<p>{h}</p>' for _, h in items)
+        else:
+            ps = ''.join(f'<p>{"• " if k == "li" else ""}{h}</p>' for k, h in items)
+        px = self.tam(clase)
+        h = self.alto(items, px, w)
+        if alto_max and h > alto_max:
+            nuevo = max(px * 0.7, px * alto_max / h)
+            extra = (extra + ';' if extra else '') + f'font-size:{round(nuevo)}px'
+            h = self.alto(items, nuevo, w)
+        return f'  <div class="el {clase}" style="{self.caja(l, t, w, extra=extra)}">{ps}</div>\n', h
+
+    def imagen(self, item, l, t, w, h) -> str:
+        tipo, ruta, alt = item
+        if tipo == 'img':
+            src, tam = self.traer(ruta)
+            if src:
+                iw, ih = tam
+                k = min(w / iw, h / ih)
+                ww, hh = iw * k, ih * k
+                return f'  <img class="el" src="{esc(src)}" alt="{esc(alt)}" style="{self.caja(l + (w - ww) / 2, t + (h - hh) / 2, ww)}">\n'
+        alt = alt or ruta
+        return f'  <div class="el hueco" style="{self.caja(l, t, w, h)}">{esc(alt or "Imagen")}</div>\n'
+
+    def traer(self, ruta: str) -> tuple[str | None, tuple[int, int]]:
+        try:
+            if re.match(r'https?://', ruta):
+                data = urlopen(Request(ruta, headers={'User-Agent': UA}), timeout=30).read()
+                nombre = Path(urlparse(ruta).path).name or 'imagen'
+            else:
+                p = Path(ruta).expanduser()
+                p = p if p.is_absolute() else (self.base / p)
+                data, nombre = p.read_bytes(), p.name
+            ext = Path(nombre).suffix.lower() or '.png'
+            data, ext = achicar_imagen(data, ext)
+            from PIL import Image
+            tam = Image.open(io.BytesIO(data)).size
+        except Exception as e:
+            self.avisos.append(f'no pude usar la imagen {ruta} ({type(e).__name__}); quedó un recuadro')
+            return None, (0, 0)
+        return guardar_imagen(self.carpeta, Path(nombre).stem, ext, data), tam
+
+    def slide(self, s: dict) -> str:
+        lay = s['layout']
+        clases_slide = ['slide']
+        fondo = s['fondo']
+        if lay == 'seccion' and not fondo and re.search(r'\.slide\.divisora\b', self.css):
+            fondo = 'divisora'
+        if fondo:
+            clases_slide.append(fondo)
+        titulo_txt = texto_plano(s['titulo']) or texto_plano(s['subtitulo']) or texto_plano(' '.join(s['cita']))[:50] or \
+            next((texto_plano(h)[:50] for col in s['cols'] for _, h in col), 'Slide')
+        out = f'<section class="{" ".join(clases_slide)}" data-titulo="{esc(titulo_txt[:70])}">\n'
+        fondo_abajo = 620 if s['fuentes'] else 680
+        arriba = 40
+        if s['titulo'] and lay not in ('seccion',):
+            ct = self.clase('titulo')
+            htxt, h = self.texto([('p', s['titulo'])], ct, 40, 28, 1200, 130)
+            out += htxt.replace('<p>', '', 1).replace('</p>', '', 1)
+            arriba = 28 + h + 32
+            if s['subtitulo']:
+                cs = self.clase('subtitulo', 'titulo-fino', 'destacado')
+                hs, h2 = self.texto([('p', s['subtitulo'])], cs, 40, arriba - 12, 1200, 80)
+                out += hs.replace('<p>', '', 1).replace('</p>', '', 1)
+                arriba += h2 + 12
+        disponible = fondo_abajo - arriba
+        cuerpo = s['cols'][0]
+        cc = self.clase('cuerpo')
+        if lay == 'seccion':
+            ct = self.clase('titulo-divisora', 'titulo')
+            centro = 'text-align:center' + (';color:inherit' if fondo else '')
+            htxt, h = self.texto([('p', s['titulo'] or s['subtitulo'])], ct, 140, 0, 1000, 300)
+            h2 = self.alto([('p', s['subtitulo'])], self.tam('cuerpo'), 1000) if s['titulo'] and s['subtitulo'] else 0
+            top = (720 - h - h2 - 20) / 2
+            htxt, _ = self.texto([('p', s['titulo'] or s['subtitulo'])], ct, 140, top, 1000, 300, centro)
+            out += htxt.replace('<p>', '', 1).replace('</p>', '', 1)
+            if s['titulo'] and s['subtitulo']:
+                cs = self.clase('subtitulo', 'titulo-fino', 'cuerpo')
+                hs, _ = self.texto([('p', s['subtitulo'])], cs, 140, top + h + 20, 1000, 200, centro)
+                out += hs.replace('<p>', '', 1).replace('</p>', '', 1)
+            if cuerpo:
+                hs, _ = self.texto(cuerpo, cc, 140, top + h + h2 + 50, 1000, 680 - (top + h + h2 + 50), 'text-align:center')
+                out += hs
+        elif lay == 'cita':
+            ci = self.clase('cita', 'destacado')
+            top = max(arriba, 200 if not s['titulo'] else arriba + 20)
+            hc, h = self.texto([('p', '“' + ' '.join(s['cita']) + '”')], ci, 140, top, 1000, fondo_abajo - top - 60)
+            out += hc
+            if s['autor']:
+                ha, _ = self.texto([('p', '— ' + s['autor'])], self.clase('chico'), 140, top + h + 24, 1000, 60, 'text-align:right')
+                out += ha
+        elif lay == 'titulo-imagen-der':
+            ht, _ = self.texto(cuerpo, cc, 50, arriba, 620, disponible)
+            out += ht
+            n = len(s['imagenes'])
+            alto_i = (disponible - 16 * (n - 1)) / n
+            for i, im in enumerate(s['imagenes']):
+                out += self.imagen(im, 710, arriba + i * (alto_i + 16), 530, alto_i)
+        elif lay == 'imagen-completa':
+            n = len(s['imagenes']) or 1
+            ancho_i = (1200 - 24 * (n - 1)) / n
+            for i, im in enumerate(s['imagenes']):
+                out += self.imagen(im, 40 + i * (ancho_i + 24), arriba, ancho_i, disponible)
+        elif lay == 'dos-columnas':
+            cols = s['cols'][:2] + [[]] * (2 - len(s['cols'][:2]))
+            for i, col in enumerate(cols):
+                ht, _ = self.texto(col, cc, 50 + i * 620, arriba, 560, disponible)
+                out += ht
+        elif lay == 'ecuacion':
+            top = arriba + 10
+            for tex in s['ecuaciones']:
+                out += f'  <div class="el {cc}" style="{self.caja(40, top, 1200, extra="text-align:center;font-size:40px")}">$${esc(tex)}$$</div>\n'
+                top += 40 * 1.35 * (tex.count("\\\\") + 1) + 40
+            ht, _ = self.texto(cuerpo, cc, 50, top + 10, 1180, fondo_abajo - top - 10)
+            out += ht
+        else:
+            ht, _ = self.texto(cuerpo, cc, 50, arriba, 1180, disponible)
+            out += ht
+        if s['imagenes'] and lay not in ('titulo-imagen-der', 'imagen-completa'):
+            self.avisos.append(f'«{titulo_txt[:40]}»: las imágenes no entran en el layout {lay}; quedaron afuera')
+        if s['fuentes']:
+            links = ''.join(f'<a href="{esc(u)}" target="_blank" rel="noopener">[{esc(t)}]</a>' for t, u in s['fuentes'])
+            out += f'  <div class="el {self.clase("fuentes", "chico")}" style="{self.caja(40, 640, 1200)}">{links}</div>\n'
+        notas = [l for l in '\n'.join(s['notas']).strip().split('\n\n') if l.strip()]
+        out += '  <aside class="notas">' + ''.join(f'<p>{md_inline(" ".join(p.split()))}</p>' for p in notas) + '</aside>\n'
+        return out + '</section>'
+
+
+def guardar_imagen(carpeta: Path, stem: str, ext: str, data: bytes) -> str:
+    d = carpeta / 'img'
+    d.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r'[^\w-]+', '-', stem).strip('-')[:40] or 'imagen'
+    nombre, i = f'{stem}{ext}', 2
+    while (d / nombre).exists() and (d / nombre).read_bytes() != data:
+        nombre, i = f'{stem}-{i}{ext}', i + 1
+    (d / nombre).write_bytes(data)
+    return f'img/{nombre}'
+
+
+def guion_a_secciones(guion: Path, estilos_css: str, W: int, H: int, carpeta: Path) -> tuple[list[str], list[dict], list[str]]:
+    bloques = leer_guion(guion.read_text(encoding='utf-8'))
+    m = Maquetador(estilos_css, W, H, carpeta, guion.parent)
+    return [m.slide(b) for b in bloques], bloques, m.avisos
+
+
+def cmd_agregar(a) -> None:
+    deck = resolver_deck(a.archivo)
+    guion = Path(a.desde).expanduser()
+    if not guion.exists():
+        die(f'no existe {guion}')
+    texto = deck.read_text(encoding='utf-8')
+    if not es_diapo(texto):
+        die(f'{deck.name} no tiene el formato diapo.')
+    W, H = medidas(texto)
+    m = re.search(r'<style id="estilos">(.*?)</style>', texto, re.S)
+    secciones, _, avisos = guion_a_secciones(guion, m.group(1) if m else '', W, H, deck.parent)
+    if not secciones:
+        die(f'{guion.name} no tiene slides.')
+    e = Estructura()
+    e.feed(texto)
+    n = len(e.slides) if a.despues is None else max(0, min(a.despues, len(e.slides)))
+    lineas = texto.split('\n')
+    corte = e.slides[n - 1]['fin'] if n else (e.slides[0]['ini'] - 1 if e.slides else next(i + 1 for i, l in enumerate(lineas) if 'id="deck"' in l))
+    nuevo = '\n'.join(lineas[:corte] + [''] + '\n\n'.join(secciones).split('\n') + lineas[corte:])
+    respaldar(deck, cada=0)
+    escribir(deck, nuevo)
+    print(f'Agregadas {len(secciones)} slides a {deck.name}: de la {n + 1} a la {n + len(secciones)}.')
+    for av in avisos:
+        print(f'  ojo: {av}')
+    print(f'Revisalas con: diapo revisar {deck.name} --slides {n + 1}-{n + len(secciones)}')
+
+
 def medidas(texto: str) -> tuple[int, int]:
     m = re.search(r'<div id="deck"[^>]*data-ancho="(\d+)"[^>]*data-alto="(\d+)"', texto)
     return (int(m.group(1)), int(m.group(2))) if m else (1280, 720)
@@ -2311,7 +2682,14 @@ def main() -> None:
     s.add_argument('carpeta', help='carpeta nueva (o ruta .html)')
     s.add_argument('--tema', default='oscuro', help='oscuro (charlas) o claro (clases); ver: diapo temas')
     s.add_argument('--titulo', help='título de la presentación')
+    s.add_argument('--desde', help='guion en markdown: una slide por bloque separado con ---')
     s.set_defaults(fn=cmd_nuevo)
+
+    s = sub.add_parser('agregar', help='sumar slides escritas en un guion markdown a una presentación')
+    s.add_argument('archivo')
+    s.add_argument('--desde', required=True, help='guion en markdown: una slide por bloque separado con ---')
+    s.add_argument('--despues', type=int, help='después de qué slide (0 = al principio; por defecto, al final)')
+    s.set_defaults(fn=cmd_agregar)
 
     s = sub.add_parser('importar', help='convertir un .pptx o .pdf')
     s.add_argument('archivo', help='.pptx (PowerPoint o Google Slides bajado como PowerPoint) o .pdf')
