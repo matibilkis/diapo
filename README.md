@@ -20,7 +20,8 @@ Hace falta Python 3.10 o más nuevo. Lo demás es opcional y el instalador te di
 | Para | Necesitás |
 |---|---|
 | Importar `.pptx` y `.pdf`, y las hojas de contacto | `pip install pillow` |
-| `revisar` y `pdf` | `pip install playwright && playwright install chromium` |
+| `revisar`, `pdf` y `pptx` | `pip install playwright && playwright install chromium` |
+| `pptx` | `pip install python-pptx` |
 | Importar `.pdf` | `poppler-utils` (`pdftoppm`, `pdftotext`) |
 | El panel de chat | [Claude Code](https://claude.com/claude-code) instalado y con sesión iniciada |
 | `diapo qr` | [uv](https://docs.astral.sh/uv/) (baja `segno` la primera vez) |
@@ -50,6 +51,7 @@ diapo ver mi-charla/mi-charla.html                         # editar en el navega
 diapo revisar mi-charla/mi-charla.html                     # capturas + textos pisados o fuera de lugar
 diapo pedidos mi-charla/mi-charla.html                     # lo que le dejaste pedido a Claude
 diapo pdf mi-charla/mi-charla.html                         # una slide por página
+diapo pptx mi-charla/mi-charla.html                        # PowerPoint editable, para subir a Google Slides
 diapo previa mi-charla/mi-charla.html                      # copia solo para mirar
 diapo config --nombre "Tu nombre" --mail "vos@correo"      # lo que va en la portada
 ```

@@ -10,6 +10,7 @@ Comandos:
   ver         la abre con un servidor local: guarda directo y se recarga sola si Claude cambia el archivo
   revisar     la renderiza sin ventana, busca problemas y saca capturas para mirar
   pdf         exporta a PDF, una slide por página
+  pptx        exporta a PowerPoint con textos editables (para Google Slides)
   pedidos     lista los pedidos a Claude que quedaron en la presentación
   actualizar  pone el motor de diapo al día en una presentación vieja
   previa      arma una copia solo para mirar, lista para publicar como artifact
@@ -43,7 +44,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 
@@ -2628,6 +2629,398 @@ def cmd_qr(a) -> None:
     print(f'Puse el QR de {a.url} en el recuadro «{desc[:60]}» (slide {a.hueco.split(":")[0]}).')
 
 
+# ----------------------------------------------------------------------------
+# pptx: exportar a PowerPoint (para subir a Google Slides)
+# ----------------------------------------------------------------------------
+
+EXTRAER_JS = r"""
+(n) => {
+  const deck = document.getElementById('deck');
+  const slides = [...deck.querySelectorAll(':scope > section.slide')];
+  const s = slides[n];
+  (window.diapo || window.deckAPI).go(n);
+  const col = c => {
+    if (!c) return null;
+    let m = c.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/), r, g, b, a = 1;
+    if (m) { r = +m[1]; g = +m[2]; b = +m[3]; if (m[4] != null) a = m[4].endsWith('%') ? parseFloat(m[4]) / 100 : +m[4]; }
+    else if ((m = c.match(/^color\(srgb\s+([-\d.e]+)\s+([-\d.e]+)\s+([-\d.e]+)(?:\s*\/\s*([\d.e]+%?))?\s*\)$/))) {
+      r = m[1] * 255; g = m[2] * 255; b = m[3] * 255; if (m[4] != null) a = m[4].endsWith('%') ? parseFloat(m[4]) / 100 : +m[4];
+    } else return null;
+    if (a <= 0.01) return null;
+    const h = x => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, '0');
+    return {hex: h(r) + h(g) + h(b), a: +(+a).toFixed(3)};
+  };
+  const familia = f => (f || '').split(',')[0].trim().replace(/^["']|["']$/g, '');
+  const estilo = (cs, nodo) => {
+    const a = nodo && nodo.closest ? nodo.closest('a[href]') : null;
+    return {font: familia(cs.fontFamily), size: parseFloat(cs.fontSize), bold: (parseInt(cs.fontWeight, 10) || 400) >= 600,
+            italic: cs.fontStyle === 'italic', underline: (cs.textDecorationLine || '').includes('underline'),
+            color: col(cs.color), href: a ? a.href : null, upper: cs.textTransform === 'uppercase'};
+  };
+  const esBloque = d => !/^inline/.test(d) && d !== 'contents' && d !== 'none';
+  const parrafos = el => {
+    const ps = []; let cur = null;
+    const nuevo = blk => {
+      const cs = getComputedStyle(blk);
+      cur = {align: cs.textAlign, lh: (parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.25) / parseFloat(cs.fontSize),
+             after: parseFloat(cs.marginBottom) || 0, runs: []};
+      ps.push(cur);
+      if (blk !== el) {
+        const bf = getComputedStyle(blk, '::before');
+        const t = (bf.content || '').replace(/^["']|["']$/g, '');
+        if (bf.content && bf.content !== 'none' && bf.content !== 'normal' && t.trim()) cur.runs.push({...estilo(bf, blk), t: t + ' '});
+      }
+    };
+    const walk = (nodo, blk) => {
+      for (const ch of nodo.childNodes) {
+        if (ch.nodeType === 3) {
+          const t = ch.nodeValue.replace(/\s+/g, ' ');
+          if (!t || (!cur && !t.trim())) continue;
+          if (!cur) nuevo(blk);
+          cur.runs.push({...estilo(getComputedStyle(ch.parentNode), ch.parentNode), t});
+        } else if (ch.nodeType === 1) {
+          if (ch.matches('aside.notas')) continue;
+          const cs = getComputedStyle(ch);
+          if (cs.display === 'none') continue;
+          if (ch.tagName === 'BR') { if (!cur) nuevo(blk); cur.runs.push({br: true, t: ''}); continue; }
+          if (esBloque(cs.display)) { cur = null; nuevo(ch); walk(ch, ch); cur = null; }
+          else walk(ch, blk);
+        }
+      }
+    };
+    walk(el, el);
+    ps.forEach(p => {
+      const txt = p.runs.filter(r => !r.br);
+      if (txt.length) { txt[0].t = txt[0].t.replace(/^\s+/, ''); txt[txt.length - 1].t = txt[txt.length - 1].t.replace(/\s+$/, ''); }
+      p.runs = p.runs.filter(r => r.br || r.t);
+      p.runs.forEach(r => { if (r.upper) r.t = r.t.toUpperCase(); });
+    });
+    return ps.filter(p => p.runs.some(r => !r.br));
+  };
+  const deckR = deck.getBoundingClientRect(), k = deckR.width / (parseInt(deck.dataset.ancho, 10) || 1280);
+  const rectDe = el => {
+    let r = el.getBoundingClientRect(), L = r.left, T = r.top, R = r.right, B = r.bottom;
+    el.querySelectorAll('*').forEach(d => { const q = d.getBoundingClientRect(); if (q.width && q.height) { L = Math.min(L, q.left); T = Math.min(T, q.top); R = Math.max(R, q.right); B = Math.max(B, q.bottom); } });
+    return {x: (L - deckR.left) / k, y: (T - deckR.top) / k, w: (R - L) / k, h: (B - T) / k};
+  };
+  const items = [];
+  [...s.querySelectorAll(':scope > .el')].forEach((el, i) => {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return;
+    const box = {x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight};
+    let rot = 0, flipH = false;
+    const mt = (cs.transform || '').match(/^matrix\(([^)]+)\)$/);
+    if (mt) { let [a, b, c, d] = mt[1].split(',').map(Number); if (a * d - b * c < 0) { flipH = true; a = -a; b = -b; } rot = Math.atan2(b, a) * 180 / Math.PI; }
+    const base = {i, ...box, rot, flipH, opacity: +cs.opacity};
+    const bt = parseFloat(cs.borderTopWidth) || 0;
+    if (el.tagName === 'DIV' && !el.textContent.trim() && !el.children.length && bt > 0 && cs.borderTopStyle !== 'none' && box.h <= bt + 1) {
+      const ang = rot * Math.PI / 180, [ox, oy] = cs.transformOrigin.split(' ').map(parseFloat);
+      const R = (px, py) => { const dx = px - (box.x + ox), dy = py - (box.y + oy); return [box.x + ox + dx * Math.cos(ang) - dy * Math.sin(ang), box.y + oy + dx * Math.sin(ang) + dy * Math.cos(ang)]; };
+      const [x1, y1] = R(box.x, box.y + bt / 2), [x2, y2] = R(box.x + box.w, box.y + bt / 2);
+      items.push({...base, tipo: 'linea', x1, y1, x2, y2, color: col(cs.borderTopColor), ancho: bt, dash: cs.borderTopStyle});
+      return;
+    }
+    const svgImg = el.tagName === 'IMG' && /\.svg(\?|#|$)|^data:image\/svg/i.test(el.currentSrc || el.src || '');
+    const raster = svgImg || el.querySelector('.tex, table, svg, canvas, video, iframe, object') || el.tagName === 'TABLE' ||
+      (cs.backgroundImage && cs.backgroundImage !== 'none') || (cs.filter && cs.filter !== 'none') || (cs.clipPath && cs.clipPath !== 'none') ||
+      (cs.maskImage && cs.maskImage !== 'none');
+    if (raster) {
+      const motivo = el.querySelector('.tex') ? 'ecuación' : (el.tagName === 'TABLE' || el.querySelector('table')) ? 'tabla' : (svgImg || el.querySelector('svg')) ? 'SVG' : 'efecto';
+      items.push({...base, tipo: 'raster', motivo, rect: rectDe(el)});
+      return;
+    }
+    const rad = cs.borderTopLeftRadius || '0px', radPx = rad.includes('%') ? parseFloat(rad) / 100 * Math.min(box.w, box.h) : parseFloat(rad) || 0;
+    const oval = el.classList.contains('circulo') || (rad.includes('%') && parseFloat(rad) >= 50) || (radPx >= Math.min(box.w, box.h) / 2 - 1 && Math.abs(box.w - box.h) < 2);
+    if (el.tagName === 'IMG') {
+      if (!el.complete || !el.naturalWidth) return;
+      items.push({...base, tipo: 'img', src: el.currentSrc || el.src, nw: el.naturalWidth, nh: el.naturalHeight, fit: cs.objectFit, oval, radio: radPx, alt: el.alt || ''});
+      return;
+    }
+    const fill = col(cs.backgroundColor);
+    const borde = bt > 0 && cs.borderTopStyle !== 'none' ? {color: col(cs.borderTopColor), ancho: bt, dash: cs.borderTopStyle} : null;
+    const ps = parrafos(el);
+    if (!ps.length && !fill && !borde) return;
+    const flex = /flex|grid/.test(cs.display);
+    const anchor = flex && cs.alignItems === 'center' ? 'middle' : flex && /end/.test(cs.alignItems) ? 'bottom' : 'top';
+    if (flex && cs.justifyContent === 'center') ps.forEach(p => { if (p.align === 'start' || p.align === 'left') p.align = 'center'; });
+    items.push({...base, tipo: 'texto', fill, borde, forma: oval ? 'elipse' : radPx > 0 ? 'redondeado' : 'rect', radio: radPx,
+                pad: ['paddingLeft', 'paddingTop', 'paddingRight', 'paddingBottom'].map(p => parseFloat(cs[p]) || 0), anchor, ps});
+  });
+  const scs = getComputedStyle(s), af = getComputedStyle(s, '::after');
+  const numero = af.content && af.content !== 'none' && af.content !== 'normal' && s.dataset.n
+    ? {t: s.dataset.n, ...estilo(af, s), right: parseFloat(af.right) || 16, bottom: parseFloat(af.bottom) || 8} : null;
+  const notas = s.querySelector('aside.notas');
+  return {bg: col(scs.backgroundColor), bgimg: !!(scs.backgroundImage && scs.backgroundImage !== 'none'), numero,
+          notas: notas ? [...notas.querySelectorAll('p, li')].map(p => p.textContent.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n') || notas.textContent.trim() : '',
+          titulo: s.dataset.titulo || '', items};
+}
+"""
+
+CAPTURA_CSS = """html.pptx-cap, html.pptx-cap body{background:transparent!important}
+html.pptx-cap #deck{box-shadow:none!important}
+html.pptx-cap [data-ui]{display:none!important}
+.slide.pptx-solo{background:transparent!important}
+.slide.pptx-solo::after, .slide.pptx-fondo::after{content:none!important}
+.slide.pptx-solo > .el:not(.pptx-obj), .slide.pptx-fondo > .el{visibility:hidden!important}"""
+
+GENERICAS = {'serif': 'Times New Roman', 'sans-serif': 'Arial', 'system-ui': 'Arial', 'monospace': 'Courier New',
+             '-apple-system': 'Arial', 'cursive': 'Comic Sans MS'}
+
+
+def imagen_para_pptx(src: str, carpeta: Path) -> tuple[io.BytesIO | None, str]:
+    """Bytes de la imagen en un formato que PowerPoint y Google Slides leen (PNG, JPEG o GIF)."""
+    try:
+        if src.startswith('data:'):
+            import base64
+            data = base64.b64decode(src.split(',', 1)[1])
+        elif src.startswith('file:'):
+            data = Path(unquote(urlparse(src).path)).read_bytes()
+        elif re.match(r'https?://', src):
+            data = urlopen(Request(src, headers={'User-Agent': UA}), timeout=30).read()
+        else:
+            data = (carpeta / src).read_bytes()
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        fmt = (im.format or '').upper()
+    except Exception as e:
+        return None, f'{type(e).__name__}'
+    if fmt in ('PNG', 'JPEG', 'GIF'):
+        return io.BytesIO(data), fmt
+    buf = io.BytesIO()
+    if getattr(im, 'n_frames', 1) > 1:
+        from PIL import ImageSequence
+        cuadros = [c.convert('RGBA') for c in ImageSequence.Iterator(im)]
+        tiempos = [c.info.get('duration', 100) for c in ImageSequence.Iterator(im)]
+        cuadros[0].save(buf, 'GIF', save_all=True, append_images=cuadros[1:], duration=tiempos, loop=0, disposal=2)
+        return io.BytesIO(buf.getvalue()), 'GIF'
+    alfa = im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info)
+    if alfa:
+        im.convert('RGBA').save(buf, 'PNG', optimize=True)
+        return io.BytesIO(buf.getvalue()), 'PNG'
+    im.convert('RGB').save(buf, 'JPEG', quality=92)
+    return io.BytesIO(buf.getvalue()), 'JPEG'
+
+
+def cmd_pptx(a) -> None:
+    try:
+        from pptx import Presentation
+        from pptx.dml.color import RGBColor
+        from pptx.enum.dml import MSO_LINE_DASH_STYLE
+        from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
+        from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
+        from pptx.oxml.ns import qn
+        from pptx.util import Emu, Pt
+    except ImportError:
+        die('para exportar a .pptx hace falta python-pptx (pip install python-pptx).')
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        die('para exportar a .pptx hace falta Playwright para Python (pip install playwright).')
+    deck = resolver_deck(a.archivo)
+    W, H = medidas(deck.read_text(encoding='utf-8', errors='replace'))
+    out = Path(a.salida).expanduser().resolve() if a.salida else deck.with_suffix('.pptx')
+    E = lambda v: Emu(round(v * 9525))
+    rgb = lambda c: RGBColor.from_string(c['hex'].upper())
+    DASH = {'dashed': MSO_LINE_DASH_STYLE.DASH, 'dotted': MSO_LINE_DASH_STYLE.ROUND_DOT}
+    ALIGN = {'center': PP_ALIGN.CENTER, 'right': PP_ALIGN.RIGHT, 'end': PP_ALIGN.RIGHT, 'justify': PP_ALIGN.JUSTIFY}
+    cuenta, fuentes, avisos = Counter(), Counter(), []
+
+    def alfa(shape, a_, en_linea=False):
+        if a_ >= 0.999:
+            return
+        base = shape._element.spPr
+        if en_linea:
+            base = base.find(qn('a:ln'))
+        clr = base.find(qn('a:solidFill')) if base is not None else None
+        clr = clr.find(qn('a:srgbClr')) if clr is not None else None
+        if clr is not None:
+            el = clr.makeelement(qn('a:alpha'), {'val': str(round(a_ * 100000))})
+            clr.append(el)
+
+    def girar(shape, it):
+        if abs(it.get('rot', 0)) > 0.05:
+            shape.rotation = it['rot'] % 360
+        if it.get('flipH'):
+            shape._element.spPr.find(qn('a:xfrm')).set('flipH', '1')
+
+    def foto(sl, stream, x, y, w, h):
+        return sl.shapes.add_picture(stream, E(x), E(y), E(w), E(h))
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = E(W), E(H)
+    blanco = prs.slide_layouts[6]
+    pw = sync_playwright().start()
+    b = pw.chromium.launch()
+    pg = b.new_page(viewport={'width': W, 'height': H}, device_scale_factor=2)
+    pg.goto(deck.as_uri())
+    pg.wait_for_timeout(400)
+    pg.evaluate('window.diapo && window.diapo.tex ? window.diapo.tex() : null')
+    pg.evaluate('Promise.all([...document.fonts].map(f => f.load().catch(() => null)))')
+    pg.evaluate('Promise.all([...document.images].map(i => i.decode ? i.decode().catch(() => null) : null))')
+    pg.add_style_tag(content=CAPTURA_CSS)
+    pg.wait_for_timeout(200)
+    total = pg.evaluate("document.querySelectorAll('#deck > section.slide').length")
+    try:
+        for n in range(total):
+            sl = prs.slides.add_slide(blanco)
+            d = pg.evaluate(EXTRAER_JS, n)
+            pg.wait_for_timeout(60)
+            if a.imagenes:
+                png = pg.screenshot(clip={'x': 0, 'y': 0, 'width': W, 'height': H}, animations='disabled',
+                                    style='[data-ui]{display:none!important}')
+                foto(sl, io.BytesIO(png), 0, 0, W, H)
+                cuenta['slides como imagen'] += 1
+            else:
+                if d['bgimg']:
+                    pg.evaluate(f"document.querySelectorAll('#deck > section.slide')[{n}].classList.add('pptx-fondo')")
+                    png = pg.screenshot(clip={'x': 0, 'y': 0, 'width': W, 'height': H})
+                    pg.evaluate(f"document.querySelectorAll('#deck > section.slide')[{n}].classList.remove('pptx-fondo')")
+                    foto(sl, io.BytesIO(png), 0, 0, W, H)
+                    cuenta['fondos como imagen'] += 1
+                elif d['bg']:
+                    sl.background.fill.solid()
+                    sl.background.fill.fore_color.rgb = rgb(d['bg'])
+                for it in d['items']:
+                    t = it['tipo']
+                    if t == 'raster':
+                        r = it['rect']
+                        pg.evaluate("([n, i]) => { document.documentElement.classList.add('pptx-cap'); const s = document.querySelectorAll('#deck > section.slide')[n];"
+                                    " s.classList.add('pptx-solo'); s.querySelectorAll(':scope > .el')[i].classList.add('pptx-obj'); }", [n, it['i']])
+                        x0, y0 = max(0, r['x']), max(0, r['y'])
+                        x1, y1 = min(W, r['x'] + r['w']), min(H, r['y'] + r['h'])
+                        if x1 - x0 >= 1 and y1 - y0 >= 1:
+                            png = pg.screenshot(clip={'x': x0, 'y': y0, 'width': x1 - x0, 'height': y1 - y0}, omit_background=True)
+                            foto(sl, io.BytesIO(png), x0, y0, x1 - x0, y1 - y0)
+                            cuenta[f'como imagen ({it["motivo"]})'] += 1
+                        pg.evaluate("n => { document.documentElement.classList.remove('pptx-cap'); const s = document.querySelectorAll('#deck > section.slide')[n];"
+                                    " s.classList.remove('pptx-solo'); s.querySelectorAll('.pptx-obj').forEach(e => e.classList.remove('pptx-obj')); }", n)
+                    elif t == 'img':
+                        stream, fmt = imagen_para_pptx(it['src'], deck.parent)
+                        if stream is None:
+                            avisos.append(f'slide {n + 1}: no pude leer la imagen {it["src"][-60:]} ({fmt})')
+                            continue
+                        x, y, w, h = it['x'], it['y'], it['w'], it['h']
+                        crop = None
+                        if it['fit'] == 'cover' and it['nw'] and it['nh']:
+                            ai, ab = it['nw'] / it['nh'], w / max(h, 1)
+                            if ai > ab:
+                                c = (1 - ab / ai) / 2
+                                crop = (c, 0, c, 0)
+                            elif ai < ab:
+                                c = (1 - ai / ab) / 2
+                                crop = (0, c, 0, c)
+                        elif it['fit'] == 'contain' and it['nw'] and it['nh']:
+                            f = min(w / it['nw'], h / it['nh'])
+                            x, y, w, h = x + (w - it['nw'] * f) / 2, y + (h - it['nh'] * f) / 2, it['nw'] * f, it['nh'] * f
+                        pic = foto(sl, stream, x, y, w, h)
+                        if crop:
+                            pic.crop_left, pic.crop_top, pic.crop_right, pic.crop_bottom = crop
+                        if it['oval']:
+                            pic.auto_shape_type = MSO_SHAPE.OVAL
+                        elif it['radio'] > 0:
+                            pic.auto_shape_type = MSO_SHAPE.ROUNDED_RECTANGLE
+                        girar(pic, it)
+                        if it['alt']:
+                            pic._element.nvPicPr.cNvPr.set('descr', it['alt'])
+                        cuenta['imágenes'] += 1
+                    elif t == 'linea':
+                        ln = sl.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, E(it['x1']), E(it['y1']), E(it['x2']), E(it['y2']))
+                        if it['color']:
+                            ln.line.color.rgb = rgb(it['color'])
+                            alfa(ln, it['color']['a'], en_linea=True)
+                        ln.line.width = Pt(it['ancho'] * 0.75)
+                        if it['dash'] in DASH:
+                            ln.line.dash_style = DASH[it['dash']]
+                        cuenta['líneas'] += 1
+                    elif t == 'texto':
+                        x, y, w, h = it['x'], it['y'], it['w'], it['h']
+                        if it['fill'] or it['borde']:
+                            tipo = {'elipse': MSO_SHAPE.OVAL, 'redondeado': MSO_SHAPE.ROUNDED_RECTANGLE}.get(it['forma'], MSO_SHAPE.RECTANGLE)
+                            sh = sl.shapes.add_shape(tipo, E(x), E(y), E(w), E(h))
+                            if tipo == MSO_SHAPE.ROUNDED_RECTANGLE:
+                                sh.adjustments[0] = min(0.5, it['radio'] / max(1, min(w, h)))
+                            if it['fill']:
+                                sh.fill.solid()
+                                sh.fill.fore_color.rgb = rgb(it['fill'])
+                                alfa(sh, it['fill']['a'])
+                            else:
+                                sh.fill.background()
+                            if it['borde'] and it['borde']['color']:
+                                sh.line.color.rgb = rgb(it['borde']['color'])
+                                alfa(sh, it['borde']['color']['a'], en_linea=True)
+                                sh.line.width = Pt(it['borde']['ancho'] * 0.75)
+                                if it['borde']['dash'] in DASH:
+                                    sh.line.dash_style = DASH[it['borde']['dash']]
+                            else:
+                                sh.line.fill.background()
+                            sh.shadow.inherit = False
+                            cuenta['formas'] += 1
+                        else:
+                            sh = sl.shapes.add_textbox(E(x), E(y), E(w), E(h))
+                        tf = sh.text_frame
+                        tf.word_wrap = True
+                        tf.auto_size = MSO_AUTO_SIZE.NONE
+                        tf.margin_left, tf.margin_top, tf.margin_right, tf.margin_bottom = (E(v) for v in it['pad'])
+                        tf.vertical_anchor = {'middle': MSO_ANCHOR.MIDDLE, 'bottom': MSO_ANCHOR.BOTTOM}.get(it['anchor'], MSO_ANCHOR.TOP)
+                        for j, pd in enumerate(it['ps']):
+                            p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                            p.alignment = ALIGN.get(pd['align'], PP_ALIGN.LEFT)
+                            p.line_spacing = max(0.5, min(3.0, pd['lh'] / 1.2))
+                            p.space_before = Pt(0)
+                            p.space_after = Pt(pd['after'] * 0.75) if j < len(it['ps']) - 1 else Pt(0)
+                            for rn in pd['runs']:
+                                if rn.get('br'):
+                                    p.add_line_break()
+                                    continue
+                                r = p.add_run()
+                                r.text = rn['t']
+                                f = r.font
+                                nombre = GENERICAS.get(rn['font'], rn['font']) or 'Arial'
+                                f.name = nombre
+                                fuentes[nombre] += 1
+                                f.size = Pt(round(rn['size'] * 0.75 * 2) / 2)
+                                f.bold, f.italic = rn['bold'], rn['italic']
+                                if rn['underline']:
+                                    f.underline = True
+                                if rn['color']:
+                                    f.color.rgb = rgb(rn['color'])
+                                    if rn['color']['a'] < 0.999:
+                                        clr = r._r.get_or_add_rPr().find(qn('a:solidFill')).find(qn('a:srgbClr'))
+                                        clr.append(clr.makeelement(qn('a:alpha'), {'val': str(round(rn['color']['a'] * 100000))}))
+                                if rn['href'] and re.match(r'(https?:|mailto:)', rn['href']):
+                                    r.hyperlink.address = rn['href']
+                        girar(sh, it)
+                        cuenta['textos editables'] += 1
+                if d['numero'] and d['numero']['color']:
+                    nm = d['numero']
+                    alto = nm['size'] * 1.3
+                    tb = sl.shapes.add_textbox(E(W - nm['right'] - 200), E(H - nm['bottom'] - alto), E(200), E(alto))
+                    tf = tb.text_frame
+                    tf.margin_left = tf.margin_top = tf.margin_right = tf.margin_bottom = 0
+                    p = tf.paragraphs[0]
+                    p.alignment = PP_ALIGN.RIGHT
+                    r = p.add_run()
+                    r.text = nm['t']
+                    r.font.name = GENERICAS.get(nm['font'], nm['font']) or 'Arial'
+                    r.font.size = Pt(nm['size'] * 0.75)
+                    r.font.color.rgb = rgb(nm['color'])
+            if d['notas']:
+                sl.notes_slide.notes_text_frame.text = d['notas']
+    finally:
+        b.close()
+        pw.stop()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(out))
+    print(f'PPTX: {out} ({total} slides, {out.stat().st_size / 1e6:.1f} MB)')
+    for k, v in sorted(cuenta.items()):
+        print(f'  {k}: {v}')
+    if fuentes:
+        print(f'  tipografías: {", ".join(sorted(fuentes))} (Google Slides las muestra si son de Google Fonts)')
+    for av in avisos:
+        print(f'  ojo: {av}')
+    print('Para Google Slides: Archivo → Importar diapositivas, o subirlo a Drive y abrirlo con Presentaciones.')
+
+
 def medidas(texto: str) -> tuple[int, int]:
     m = re.search(r'<div id="deck"[^>]*data-ancho="(\d+)"[^>]*data-alto="(\d+)"', texto)
     return (int(m.group(1)), int(m.group(2))) if m else (1280, 720)
@@ -2903,6 +3296,12 @@ def main() -> None:
     s.add_argument('archivo')
     s.add_argument('-o', '--salida', help='PDF de salida (por defecto, al lado del .html)')
     s.set_defaults(fn=cmd_pdf)
+
+    s = sub.add_parser('pptx', help='exportar a PowerPoint, con textos editables (para subir a Google Slides)')
+    s.add_argument('archivo')
+    s.add_argument('-o', '--salida', help='.pptx de salida (por defecto, al lado del .html)')
+    s.add_argument('--imagenes', action='store_true', help='cada slide como una imagen: idéntica, pero sin texto editable')
+    s.set_defaults(fn=cmd_pptx)
 
     s = sub.add_parser('pedidos', help='listar los pedidos a Claude')
     s.add_argument('archivo')

@@ -25,6 +25,7 @@ Las ecuaciones se escriben en LaTeX dentro del texto, `$…$` en línea y `$$…
 | `diapo qr ARCHIVO.html URL [--hueco N[:K]]` | QR en SVG (con `uv` y `segno`), en `img/` y opcionalmente en un recuadro. |
 | `diapo config --nombre "…" --mail "…" [--modelo-chat sonnet]` | Lo que va en la portada de las presentaciones nuevas, y el modelo del chat (Opus si no se indica). |
 | `diapo pdf ARCHIVO.html [-o salida.pdf]` | Una slide por página, con fondos. |
+| `diapo pptx ARCHIVO.html [-o salida.pptx] [--imagenes]` | PowerPoint para subir a Google Slides. Textos editables con su tipografía, tamaño, color, links y viñetas; imágenes nativas (recortes y círculos incluidos); formas, líneas y notas. Lo que PowerPoint no representa va como imagen exacta: ecuaciones (el párrafo entero que las tiene), tablas, SVG y fondos con imagen. `--imagenes`: cada slide como imagen, idéntica pero no editable. |
 | `diapo previa ARCHIVO.html` | Copia solo para mirar, en `.diapo/previa/`, más la lista de archivos que usa. Sirve para publicar un artifact. |
 | `diapo actualizar ARCHIVO.html` | Reemplaza el motor embebido por el actual. Deja un respaldo. |
 | `diapo temas` | Temas disponibles. |
