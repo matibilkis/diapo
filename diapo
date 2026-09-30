@@ -2648,7 +2648,126 @@ def cmd_qr(a) -> None:
 # ----------------------------------------------------------------------------
 
 EXTRAER_JS = r"""
-(n) => {
+({n, texImg}) => {
+  const TEX_SIM = {alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ϵ', varepsilon: 'ε', zeta: 'ζ', eta: 'η', theta: 'θ', vartheta: 'ϑ',
+    iota: 'ι', kappa: 'κ', lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π', varpi: 'ϖ', rho: 'ρ', varrho: 'ϱ', sigma: 'σ', varsigma: 'ς', tau: 'τ',
+    upsilon: 'υ', phi: 'ϕ', varphi: 'φ', chi: 'χ', psi: 'ψ', omega: 'ω', Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π',
+    Sigma: 'Σ', Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
+    langle: '⟨', rangle: '⟩', lvert: '|', rvert: '|', vert: '|', mid: '|', lVert: '‖', rVert: '‖', Vert: '‖', '|': '‖', '{': '{', '}': '}', lbrace: '{', rbrace: '}',
+    lfloor: '⌊', rfloor: '⌋', lceil: '⌈', rceil: '⌉', cdot: '·', times: '×', div: '÷', pm: '±', mp: '∓', leq: '≤', le: '≤', geq: '≥', ge: '≥', neq: '≠', ne: '≠',
+    approx: '≈', equiv: '≡', sim: '∼', simeq: '≃', cong: '≅', propto: '∝', ll: '≪', gg: '≫', to: '→', rightarrow: '→', leftarrow: '←', gets: '←',
+    Rightarrow: '⇒', Leftarrow: '⇐', Leftrightarrow: '⇔', leftrightarrow: '↔', longrightarrow: '⟶', longleftarrow: '⟵', Longrightarrow: '⟹',
+    Longleftrightarrow: '⟺', implies: '⟹', iff: '⟺', mapsto: '↦', infty: '∞', sum: '∑', prod: '∏', int: '∫', oint: '∮', partial: '∂', nabla: '∇',
+    in: '∈', notin: '∉', ni: '∋', subset: '⊂', subseteq: '⊆', supset: '⊃', cup: '∪', cap: '∩', forall: '∀', exists: '∃', neg: '¬', lnot: '¬',
+    land: '∧', wedge: '∧', lor: '∨', vee: '∨', otimes: '⊗', oplus: '⊕', odot: '⊙', dagger: '†', ddagger: '‡', hbar: 'ℏ', ell: 'ℓ', ldots: '…', dots: '…',
+    cdots: '⋯', vdots: '⋮', ddots: '⋱', circ: '∘', bullet: '•', star: '⋆', ast: '∗', emptyset: '∅', varnothing: '∅', angle: '∠', perp: '⊥',
+    parallel: '∥', prime: '′', degree: '°', '%': '%', '$': '$', '#': '#', '&': '&', '_': '_', bmod: ' mod '};
+  const TEX_GRIEGA = /^(alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|tau|upsilon|phi|varphi|chi|psi|omega)$/;
+  const TEX_FUN = new Set(['sin', 'cos', 'tan', 'log', 'ln', 'exp', 'min', 'max', 'det', 'arg', 'lim', 'Pr', 'sup', 'inf', 'tr', 'Tr', 'dim', 'ker', 'deg',
+    'gcd', 'sinh', 'cosh', 'tanh', 'arcsin', 'arccos', 'arctan', 'sec', 'csc', 'cot', 'mod']);
+  const TEX_ESP = {',': ' ', ';': ' ', ':': ' ', '>': ' ', '!': '', ' ': ' ', quad: ' ', qquad: '  ', enspace: ' ', thinspace: ' '};
+  const TEX_ACENTO = {hat: '̂', widehat: '̂', tilde: '̃', widetilde: '̃', bar: '̄', overline: '̅', vec: '⃗', dot: '̇', ddot: '̈'};
+  const TEX_BB = {A: '𝔸', B: '𝔹', C: 'ℂ', D: '𝔻', E: '𝔼', F: '𝔽', G: '𝔾', H: 'ℍ', I: '𝕀', J: '𝕁', K: '𝕂', L: '𝕃', M: '𝕄', N: 'ℕ', O: '𝕆', P: 'ℙ',
+    Q: 'ℚ', R: 'ℝ', S: '𝕊', T: '𝕋', U: '𝕌', V: '𝕍', W: '𝕎', X: '𝕏', Y: '𝕐', Z: 'ℤ', 1: '𝟙'};
+  const TEX_NADA = new Set(['left', 'right', 'big', 'Big', 'bigg', 'Bigg', 'bigl', 'bigr', 'Bigl', 'Bigr', 'biggl', 'biggr', 'displaystyle', 'textstyle',
+    'limits', 'nolimits', 'middle']);
+  const TEX_COLOR = {red: 'ff0000', blue: '0000ff', green: '008000', black: '000000', white: 'ffffff', gray: '808080', grey: '808080', orange: 'ffa500',
+    purple: '800080', yellow: 'ffff00', cyan: '00ffff', magenta: 'ff00ff', brown: 'a52a2a', teal: '008080'};
+  // TeX en línea → trozos de texto con itálica, negrita, super/subíndice y color. null si no se puede sin perder contenido.
+  const texRuns = src => {
+    const out = [];
+    const add = (t, c, it) => {
+      if (!t) return;
+      const o = {pos: c.pos || 0, it: !!it && !c.up, b: !!c.b, color: c.color || null};
+      const l = out[out.length - 1];
+      if (l && l.pos === o.pos && l.it === o.it && l.b === o.b && l.color === o.color) l.t += t; else out.push({t, ...o});
+    };
+    const REL = '=<>≤≥≠≈≡∼≃≅∝≪≫→←⇒⇐⇔↔⟶⟵⟹⟺↦∈∉∋⊂⊆⊃≢⊄≁≉', BIN = '+−×÷±∓·⊗⊕⊙∘∪∩∧∨';
+    const sym = (t, c, it) => {
+      if (c.pos || t.length !== 1) return add(t, c, it);
+      if (REL.includes(t)) return add('\u2004' + t + '\u2004', c);
+      if (BIN.includes(t)) {
+        const l = out[out.length - 1], prev = l ? l.t.slice(-1) : '';
+        return add(!prev || '([{⟨|\u2004'.includes(prev) || REL.includes(prev) || BIN.includes(prev) ? t : '\u2005' + t + '\u2005', c);
+      }
+      add(t, c, it);
+    };
+    const grupo = (s, k) => {
+      while (s[k.i] === ' ') k.i++;
+      if (s[k.i] === '{') {
+        let d = 0, j = k.i;
+        for (; j < s.length; j++) { if (s[j] === '\\') { j++; continue; } if (s[j] === '{') d++; else if (s[j] === '}' && !--d) break; }
+        if (j >= s.length) throw 0;
+        const g = s.slice(k.i + 1, j); k.i = j + 1; return g;
+      }
+      if (s[k.i] === '\\') { const m = s.slice(k.i).match(/^\\([a-zA-Z]+|.)/); k.i += m[0].length; return m[0]; }
+      if (k.i >= s.length) throw 0;
+      return s[k.i++];
+    };
+    const unAtomo = g => /^\s*(\\[a-zA-Z]+|\\.|[a-zA-Z]|\d+(\.\d+)?|\\sqrt\s*(\{\s*[\w\\]+\s*\}|[\w]|\\[a-zA-Z]+))\s*$/.test(g);
+    const parse = (s, c) => {
+      const k = {i: 0};
+      while (k.i < s.length) {
+        const ch = s[k.i];
+        if (/\s/.test(ch)) { k.i++; continue; }
+        if (ch === '{') { parse(grupo(s, k), c); continue; }
+        if (ch === '}' || ch === '&') throw 0;
+        if (ch === '^' || ch === '_') { k.i++; parse(grupo(s, k), {...c, pos: ch === '^' ? 1 : -1}); continue; }
+        if (ch === "'") { add('′', c); k.i++; continue; }
+        if (ch === '\\') {
+          const m = s.slice(k.i).match(/^\\([a-zA-Z]+|.)/); k.i += m[0].length;
+          const cmd = m[1];
+          if (TEX_NADA.has(cmd)) continue;
+          if (cmd in TEX_ESP) { add(TEX_ESP[cmd], c); continue; }
+          if (TEX_FUN.has(cmd)) { add(cmd, c); continue; }
+          if (cmd in TEX_SIM) { sym(TEX_SIM[cmd], c, TEX_GRIEGA.test(cmd)); continue; }
+          if (/^(mathrm|text|textrm|textnormal|operatorname|mathsf|texttt|mathtt)$/.test(cmd)) { const g = grupo(s, k); add(cmd.startsWith('text') ? g : g.replace(/\s+/g, ''), {...c, up: true}); continue; }
+          if (/^(textbf)$/.test(cmd)) { add(grupo(s, k), {...c, up: true, b: true}); continue; }
+          if (/^(mathbf|boldsymbol|bm)$/.test(cmd)) { parse(grupo(s, k), {...c, b: true}); continue; }
+          if (/^(mathit|textit|mathcal|mathscr|mathfrak)$/.test(cmd)) { parse(grupo(s, k), c); continue; }
+          if (cmd === 'mathbb') { for (const x of grupo(s, k)) if (x.trim()) add(TEX_BB[x] || x, c); continue; }
+          if (cmd === 'textcolor' || cmd === 'color') {
+            const nombre = grupo(s, k).trim(), hex = /^#?[0-9a-fA-F]{6}$/.test(nombre) ? nombre.replace('#', '').toLowerCase() : TEX_COLOR[nombre];
+            if (cmd === 'color') { c = {...c, color: hex || c.color}; continue; }
+            parse(grupo(s, k), {...c, color: hex || c.color}); continue;
+          }
+          if (cmd in TEX_ACENTO) {
+            const g = grupo(s, k).trim(), m2 = g.match(/^\\([a-zA-Z]+)$/);
+            const base = g.length === 1 ? g : m2 && TEX_SIM[m2[1]] ? TEX_SIM[m2[1]] : null;
+            if (!base) throw 0;
+            add(base + TEX_ACENTO[cmd], c, /[a-zA-Z]/.test(base) || (m2 && TEX_GRIEGA.test(m2[1]))); continue;
+          }
+          if (cmd === 'not') {
+            const g = grupo(s, k), m2 = g.match(/^\\([a-zA-Z]+)$/), base = m2 ? TEX_SIM[m2[1]] : g;
+            if (!base) throw 0;
+            sym({'=': '≠', '≡': '≢', '∈': '∉', '⊂': '⊄', '∼': '≁', '≈': '≉'}[base] || base + '̸', c); continue;
+          }
+          if (cmd === 'pmod') { add(' (mod ', c); parse(grupo(s, k), c); add(')', c); continue; }
+          if (cmd === 'sqrt') {
+            if (s[k.i] === '[') throw 0;
+            const g = grupo(s, k);
+            add('√', c);
+            if (unAtomo(g)) parse(g, c); else { add('(', c); parse(g, c); add(')', c); }
+            continue;
+          }
+          if (cmd === 'frac' || cmd === 'dfrac' || cmd === 'tfrac') {
+            const a = grupo(s, k), b = grupo(s, k);
+            for (const [x, sep] of [[a, '/'], [b, '']]) {
+              if (unAtomo(x)) parse(x, c); else { add('(', c); parse(x, c); add(')', c); }
+              if (sep) add(sep, c);
+            }
+            continue;
+          }
+          if (cmd === 'xrightarrow' || cmd === 'xleftarrow') { const g = grupo(s, k); add(cmd === 'xrightarrow' ? '→' : '←', c); parse(g, {...c, pos: 1}); continue; }
+          throw 0;
+        }
+        if (/[a-zA-Z]/.test(ch)) { add(ch, c, true); k.i++; continue; }
+        sym(ch === '-' ? '−' : ch === '*' ? '∗' : ch, c); k.i++;
+      }
+    };
+    try { parse(src, {pos: 0}); } catch (_) { return null; }
+    return out;
+  };
   const deck = document.getElementById('deck');
   const slides = [...deck.querySelectorAll(':scope > section.slide')];
   const s = slides[n];
@@ -2694,6 +2813,13 @@ EXTRAER_JS = r"""
           cur.runs.push({...estilo(getComputedStyle(ch.parentNode), ch.parentNode), t});
         } else if (ch.nodeType === 1) {
           if (ch.matches('aside.notas')) continue;
+          if (ch.matches('.tex')) {
+            const st = estilo(getComputedStyle(ch), ch);
+            if (!cur) nuevo(blk);
+            (texRuns(ch.dataset.tex) || []).forEach(r => cur.runs.push({...st, t: r.t, italic: r.it, bold: st.bold || r.b, pos: r.pos,
+              color: r.color ? {hex: r.color, a: 1} : st.color, math: true, size: st.size * 1.1}));
+            continue;
+          }
           const cs = getComputedStyle(ch);
           if (cs.display === 'none') continue;
           if (ch.tagName === 'BR') { if (!cur) nuevo(blk); cur.runs.push({br: true, t: ''}); continue; }
@@ -2735,11 +2861,13 @@ EXTRAER_JS = r"""
       return;
     }
     const svgImg = el.tagName === 'IMG' && /\.svg(\?|#|$)|^data:image\/svg/i.test(el.currentSrc || el.src || '');
-    const raster = svgImg || el.querySelector('.tex, table, svg, canvas, video, iframe, object') || el.tagName === 'TABLE' ||
+    const texs = [...el.querySelectorAll('.tex')];
+    const texRaster = texs.length && (texImg || texs.some(t => t.hasAttribute('data-bloque') || !texRuns(t.dataset.tex || '')));
+    const raster = svgImg || texRaster || el.querySelector('table, svg:not(.tex svg), canvas, video, iframe, object') || el.tagName === 'TABLE' ||
       (cs.backgroundImage && cs.backgroundImage !== 'none') || (cs.filter && cs.filter !== 'none') || (cs.clipPath && cs.clipPath !== 'none') ||
       (cs.maskImage && cs.maskImage !== 'none');
     if (raster) {
-      const motivo = el.querySelector('.tex') ? 'ecuación' : (el.tagName === 'TABLE' || el.querySelector('table')) ? 'tabla' : (svgImg || el.querySelector('svg')) ? 'SVG' : 'efecto';
+      const motivo = texRaster ? 'ecuación' : (el.tagName === 'TABLE' || el.querySelector('table')) ? 'tabla' : (svgImg || el.querySelector('svg')) ? 'SVG' : 'efecto';
       items.push({...base, tipo: 'raster', motivo, rect: rectDe(el)});
       return;
     }
@@ -2877,7 +3005,7 @@ def cmd_pptx(a) -> None:
     try:
         for n in range(total):
             sl = prs.slides.add_slide(blanco)
-            d = pg.evaluate(EXTRAER_JS, n)
+            d = pg.evaluate(EXTRAER_JS, {'n': n, 'texImg': bool(a.ecuaciones_imagen)})
             pg.wait_for_timeout(60)
             if a.imagenes:
                 png = pg.screenshot(clip={'x': 0, 'y': 0, 'width': W, 'height': H}, animations='disabled',
@@ -2989,7 +3117,11 @@ def cmd_pptx(a) -> None:
                                 r = p.add_run()
                                 r.text = rn['t']
                                 f = r.font
-                                nombre = GENERICAS.get(rn['font'], rn['font']) or 'Arial'
+                                nombre = 'STIX Two Text' if rn.get('math') else (GENERICAS.get(rn['font'], rn['font']) or 'Arial')
+                                if rn.get('math'):
+                                    cuenta['trozos de ecuación como texto'] += 1
+                                if rn.get('pos'):
+                                    r._r.get_or_add_rPr().set('baseline', '30000' if rn['pos'] > 0 else '-25000')
                                 f.name = nombre
                                 fuentes[nombre] += 1
                                 f.size = Pt(round(rn['size'] * 0.75 * 2) / 2)
@@ -3315,6 +3447,7 @@ def main() -> None:
     s.add_argument('archivo')
     s.add_argument('-o', '--salida', help='.pptx de salida (por defecto, al lado del .html)')
     s.add_argument('--imagenes', action='store_true', help='cada slide como una imagen: idéntica, pero sin texto editable')
+    s.add_argument('--ecuaciones-imagen', action='store_true', help='las ecuaciones en línea como imagen exacta (por defecto van como texto editable)')
     s.set_defaults(fn=cmd_pptx)
 
     s = sub.add_parser('pedidos', help='listar los pedidos a Claude')
